@@ -1,0 +1,26 @@
+{
+  "description": "Sample UL grant from 5gone cell-wide-dos attacker.log (rapid=5, c_rnti=17922)",
+  "source": "data/5gone-dataset/cell-wide-dos/attacker.log",
+  "events": [
+    {
+      "rapid": 5,
+      "ta": 0,
+      "c_rnti": 17922,
+      "ul_dci": {
+        "freq_hopping": false,
+        "pusch_freq_res": 2,
+        "pusch_time_res": 1,
+        "mcs": 4,
+        "tpc_for_pusch": 3,
+        "csi_request": false
+      },
+      "grant": {
+        "k": 6,
+        "mcs": 4,
+        "tbs_bits": 264,
+        "pusch_freq_res": 2,
+        "mapping": "A"
+      }
+    }
+  ]
+}

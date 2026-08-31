@@ -1,0 +1,44 @@
+# srsRAN Project gNB — USRP B210, TDD n78, 20 MHz
+# Based on: srsRAN_Project/configs/gnb_rf_b200_tdd_n78_20mhz.yml
+# Open5GS AMF default NGAP: 127.0.0.5 — must match config/open5gs/amf.yaml.patch
+
+cu_cp:
+  amf:
+    addr: 127.0.0.5
+    port: 38412
+    bind_addr: 127.0.0.1
+    supported_tracking_areas:
+      - tac: 1
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_sdr:
+  device_driver: uhd
+  device_args: type=b200,num_recv_frames=512,num_send_frames=512,master_clock_rate=23.04e6
+  srate: 23.04
+  otw_format: sc12
+  tx_gain: 80
+  rx_gain: 40
+
+cell_cfg:
+  dl_arfcn: 632628
+  band: 78
+  channel_bandwidth_MHz: 20
+  common_scs: 30
+  plmn: "00101"
+  tac: 1
+  pci: 1
+
+log:
+  filename: /tmp/gnb_5gone.log
+  all_level: info
+  mac_level: info
+  phy_level: warning
+
+pcap:
+  mac_enable: false
+  mac_filename: /tmp/gnb_mac.pcap
+  ngap_enable: false
+  ngap_filename: /tmp/gnb_ngap.pcap

@@ -1,0 +1,22 @@
+# Open5GS AMF patch reference — PLMN 001/01, TAC 1, NGAP 127.0.0.5
+#
+# After install, run:
+#   bash scripts/patch-open5gs-plmn.sh
+#
+# Or manually edit /etc/open5gs/amf.yaml and /etc/open5gs/nrf.yaml:
+#
+# amf:
+#   ngap:
+#     server:
+#       - address: 127.0.0.5
+#   guami:
+#     - plmn_id: { mcc: 001, mnc: 01 }
+#   tai:
+#     - plmn_id: { mcc: 001, mnc: 01 }, tac: 1
+#   plmn_support:
+#     - plmn_id: { mcc: 001, mnc: 01 }, s_nssai: [{ sst: 1 }]
+#
+# nrf:
+#   serving:  [{ plmn_id: { mcc: 001, mnc: 01 } }]
+#
+# Must match config/srsran/gnb_20mhz.yml (PLMN 00101, TAC 1)
