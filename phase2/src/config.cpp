@@ -38,6 +38,10 @@ AttackConfig load_config(const std::string& yaml_path)
     cfg.tx_gain = yaml_dbl(r, "tx_gain", cfg.tx_gain);
     cfg.rx_gain = yaml_dbl(r, "rx_gain", cfg.rx_gain);
     cfg.device_args = yaml_str(r, "device_args", cfg.device_args);
+    cfg.tx_subdev = yaml_str(r, "tx_subdev", cfg.tx_subdev);
+    cfg.rx_subdev = yaml_str(r, "rx_subdev", cfg.rx_subdev);
+    cfg.tx_antenna = yaml_str(r, "tx_antenna", cfg.tx_antenna);
+    cfg.rx_antenna = yaml_str(r, "rx_antenna", cfg.rx_antenna);
   }
 
   if (root["cell"]) {
@@ -57,6 +61,16 @@ AttackConfig load_config(const std::string& yaml_path)
     const auto& a = root["attack"];
     cfg.symbol_advance_us = yaml_dbl(a, "symbol_advance_us", cfg.symbol_advance_us);
     cfg.tx_power_scale = yaml_dbl(a, "tx_power_scale", cfg.tx_power_scale);
+  }
+
+  if (root["loopback"]) {
+    const auto& lb = root["loopback"];
+    cfg.loopback_iterations = lb["iterations"]
+        ? lb["iterations"].as<uint32_t>() : cfg.loopback_iterations;
+    cfg.loopback_window_ms = yaml_dbl(lb, "window_ms", cfg.loopback_window_ms);
+    cfg.loopback_tx_scale = yaml_dbl(lb, "tx_scale", cfg.loopback_tx_scale);
+    cfg.loopback_dump_path = yaml_str(lb, "dump_path", cfg.loopback_dump_path);
+    cfg.loopback_probe = yaml_bool(lb, "probe", cfg.loopback_probe);
   }
 
   if (root["paths"]) {
@@ -88,13 +102,22 @@ AttackConfig load_config_with_overrides(const std::string& yaml_path, int argc, 
       cfg.device_args = argv[++i];
     } else if (std::strcmp(argv[i], "--symbol-advance-us") == 0 && i + 1 < argc) {
       cfg.symbol_advance_us = std::stod(argv[++i]);
+    } else if (std::strcmp(argv[i], "--tx-subdev") == 0 && i + 1 < argc) {
+      cfg.tx_subdev = argv[++i];
+    } else if (std::strcmp(argv[i], "--rx-subdev") == 0 && i + 1 < argc) {
+      cfg.rx_subdev = argv[++i];
+    } else if (std::strcmp(argv[i], "--loop-iterations") == 0 && i + 1 < argc) {
+      cfg.loopback_iterations = static_cast<uint32_t>(std::stoul(argv[++i]));
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       std::cout << "5gone-rar-dos — RAR DoS uplink overshadow (Section 4.1)\n"
-                << "  --mode sim|inject|live|bus\n"
+                << "  --mode sim|inject|live|bus|loopback\n"
                 << "  --grant FILE.json\n"
                 << "  --dataset DIR\n"
                 << "  --device UHD_ARGS\n"
                 << "  --symbol-advance-us US\n"
+                << "  --tx-subdev SPEC  (loopback; default A:A)\n"
+                << "  --rx-subdev SPEC  (loopback; default A:B)\n"
+                << "  --loop-iterations N\n"
                 << "  --dry-run\n";
       std::exit(0);
     }

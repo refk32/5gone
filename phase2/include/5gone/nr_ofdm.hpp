@@ -47,6 +47,11 @@ public:
     uint32_t num_subcarriers() const { return num_subcarriers_; }
     uint32_t samples_per_slot() const { return samples_per_slot_; }
 
+    // Per-symbol cyclic-prefix and total (CP+useful) lengths for the symbol in
+    // a subframe (l = 0..27). Used by the cell-syncer to locate SSB/PSS timing.
+    uint32_t cp_len(uint32_t symbol_in_subframe) const;
+    uint32_t sym_len(uint32_t symbol_in_subframe) const;
+
 private:
     // FFT of `in` (size fft_size_) -> frequency bins (size fft_size_).
     std::vector<std::complex<float>> fft(const std::vector<std::complex<float>>& in) const;

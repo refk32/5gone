@@ -21,8 +21,31 @@ cell:
   dl_arfcn: 632628
 
 attack:
-  symbol_advance_us: 500   # B210 USB target; paper X310 ~672–2287 µs
+  # Measured B210 cross-chain near-field loopback latency (Step 4): +7.5 µs.
+  # TX must emit EARLY by this amount so the burst lands exactly on target.
+  symbol_advance_us: 8   # from loopback harness avg delay
   tx_power_scale: 1.5      # relative IQ scale before PA
+
+# Step 4 — loopback timing harness (single B210). Port map:
+#   TX/RX A = chain A switched TX port  -> TX (antenna 1)
+#   TX/RX B = chain B switched RX port  -> RX (antenna 2)
+#   RX2 A / RX2 B = RX-only alternate inputs on each chain (cabled loopback).
+# Two antenna options:
+#   (A) Near-field: antennas on TX/RX A AND TX/RX B, tips <=3 cm apart.
+#       -> rx_subdev "A:B" + rx_antenna "TX/RX"  (this config)
+#   (B) Cabled: SMA TX/RX A -> RX2 A (same chain). Then use
+#       rx_subdev "A:A" + rx_antenna "RX2", tx_gain: 0, rx_gain: 20.
+# After a pass, set attack.symbol_advance_us to the measured avg delay.
+loopback:
+  iterations: 3
+  window_ms: 200
+  tx_subdev: "A:A"    # TX on TX/RX A (antenna 1)
+  rx_subdev: "A:B"    # RX on TX/RX B (antenna 2) — cross-chain near-field
+  tx_antenna: "TX/RX"
+  rx_antenna: "TX/RX"
+  tx_scale: 5.0      # scale applied to the TX marker burst (boost near-field RX)
+  probe: false        # run TX RF/RSSI probe stages (set false for fast re-runs)
+  # dump_path: /tmp/lb0.cf32   # set to write iter-0 RX window for offline inspection
 
 paths:
   iq_template_dir: phase2/iq_templates

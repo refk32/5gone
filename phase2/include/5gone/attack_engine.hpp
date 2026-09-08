@@ -23,6 +23,7 @@ private:
   int run_inject();
   int run_live();
   int run_bus();
+  int run_loopback();
 
   void execute_attack(const RarEvent& ev);
 

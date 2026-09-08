@@ -46,6 +46,8 @@ set(5GONE_SOURCES
   src/mac_rar.cpp
   # NR cell search: PSS/SSS generation + detection (Step 1)
   src/nr_pss.cpp
+  # Loopback timing harness: TX->RX latency measurement (Step 4)
+  src/latency.cpp
 )
 
 add_executable(5gone-rar-dos ${5GONE_SOURCES})
@@ -81,6 +83,44 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
   target_link_libraries(test_pss PRIVATE ${LIQUID_LIBRARY})
 endif()
 target_link_libraries(test_pss PRIVATE m)
+
+# --- CellSync test (Step 2) ---
+# Self-contained: no UHD, no srsRAN. Synthesizes a lab SSB slot (with a
+# lead-in and a CFO offset), locks CellSync onto it, checks the slot-clock
+# math, and verifies noise / wrong-PCI buffers do NOT lock.
+set(CELLSYNC_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+)
+add_executable(test_cell_sync ${CELLSYNC_TEST_SRC})
+target_include_directories(test_cell_sync PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_cell_sync PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_cell_sync PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_cell_sync PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_cell_sync PRIVATE m)
+
+# --- Loopback latency harness test (Step 4) ---
+# Self-contained: no UHD, no srsRAN. Injects the marker burst into a synthetic
+# RX buffer at a known offset, then checks measure_latency() recovers exactly
+# that offset (and rejects windows that exclude it, and pure noise).
+set(LOOPBACK_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_loopback.cpp"
+  "${CMAKE_SOURCE_DIR}/src/latency.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+)
+add_executable(test_loopback ${LOOPBACK_TEST_SRC})
+target_include_directories(test_loopback PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_loopback PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_loopback PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_loopback PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_loopback PRIVATE m)
 
 # --- Old srsRAN 4G (srsRANRF) for the full PDCCH polar/CRC decode path ---
 # Gated behind GONE_HAVE_SRSRAN_OLD. When the old srsRAN_4G C API is available
@@ -232,6 +272,119 @@ if(5GONE_ENABLE_SRSRAN_OLD)
   else()
     message(STATUS "5Gone: srsRAN 4G not found — correlation-only PDCCH decode (run scripts/install-srsran-4g.sh)")
   endif()
+endif()
+
+# --- Capture decode tool + test (Step 3) ---
+# 5gone-decode reads a raw .cf32 capture, CellSync-locks on the SSB (optional),
+# and runs the RAR decode chain over it. Both link the same offline decoder
+# sources as the main binary (no UHD/yaml). When srsRAN-4G is present they
+# inherit its DCI-bits decode path; otherwise correlation-only. `test_rar` only
+# exists when srsRAN-4G was configured, so it is a reliable presence gate.
+set(DECODE_TOOL_SRC
+  "${CMAKE_SOURCE_DIR}/tools/5gone_decode.cpp"
+  "${CMAKE_SOURCE_DIR}/tools/decode_capture.hpp"
+  "${CMAKE_SOURCE_DIR}/src/cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp")
+add_executable(5gone-decode ${DECODE_TOOL_SRC})
+target_include_directories(5gone-decode PRIVATE
+  "${CMAKE_SOURCE_DIR}/include"
+  "${CMAKE_SOURCE_DIR}")
+if(TARGET test_rar)
+  target_compile_definitions(5gone-decode PRIVATE GONE_HAVE_SRSRAN_OLD=1)
+  target_include_directories(5gone-decode PRIVATE ${SRSRAN4G_INCLUDE_DIR})
+  target_link_directories(5gone-decode PRIVATE ${SRSRAN4G_LINK_DIRS})
+  target_sources(5gone-decode PRIVATE
+    "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_chanalloc.c"
+    "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_interleaver.c")
+  target_link_libraries(5gone-decode PRIVATE
+    -Wl,--start-group srsran_common srsran_phy srsran_mac srslog support srsran_asn1 asn1_utils -Wl,--end-group)
+  if(SRSRAN4G_FFTW)
+    target_link_libraries(5gone-decode PRIVATE ${SRSRAN4G_FFTW})
+  endif()
+  if(SRSRAN4G_MBEDTLS)
+    target_link_libraries(5gone-decode PRIVATE ${SRSRAN4G_MBEDTLS})
+  endif()
+  target_link_libraries(5gone-decode PRIVATE m pthread)
+else()
+  if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+    target_compile_definitions(5gone-decode PRIVATE HAVE_LIQUID=1)
+    target_include_directories(5gone-decode PRIVATE ${LIQUID_INCLUDE_DIR})
+    target_link_libraries(5gone-decode PRIVATE ${LIQUID_LIBRARY})
+  endif()
+  target_link_libraries(5gone-decode PRIVATE m)
+endif()
+install(TARGETS 5gone-decode RUNTIME DESTINATION bin)
+
+# --- Loopback RX dump analyzer (Step 4 debug) ---
+# Self-contained: no UHD, no srsRAN. Reads a cf32 dump from run_loopback's
+# dump_path and scans the WHOLE buffer for the marker burst, so we can tell
+# whether RF coupling or timing-slip is the reason the harness missed it.
+set(ANALYZE_LB_SRC
+  "${CMAKE_SOURCE_DIR}/tools/analyze_lb.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+)
+add_executable(analyze_lb ${ANALYZE_LB_SRC})
+target_include_directories(analyze_lb PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(analyze_lb PRIVATE HAVE_LIQUID=1)
+  target_include_directories(analyze_lb PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(analyze_lb PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(analyze_lb PRIVATE m)
+
+set(DECODE_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_decode_tool.cpp"
+  "${CMAKE_SOURCE_DIR}/tools/decode_capture.hpp"
+  "${CMAKE_SOURCE_DIR}/src/cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp")
+add_executable(test_decode_tool ${DECODE_TEST_SRC})
+target_include_directories(test_decode_tool PRIVATE
+  "${CMAKE_SOURCE_DIR}/include"
+  "${CMAKE_SOURCE_DIR}")
+if(TARGET test_rar)
+  target_compile_definitions(test_decode_tool PRIVATE GONE_HAVE_SRSRAN_OLD=1)
+  target_include_directories(test_decode_tool PRIVATE ${SRSRAN4G_INCLUDE_DIR})
+  target_link_directories(test_decode_tool PRIVATE ${SRSRAN4G_LINK_DIRS})
+  target_sources(test_decode_tool PRIVATE
+    "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_chanalloc.c"
+    "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_interleaver.c")
+  target_link_libraries(test_decode_tool PRIVATE
+    -Wl,--start-group srsran_common srsran_phy srsran_mac srslog support srsran_asn1 asn1_utils -Wl,--end-group)
+  if(SRSRAN4G_FFTW)
+    target_link_libraries(test_decode_tool PRIVATE ${SRSRAN4G_FFTW})
+  endif()
+  if(SRSRAN4G_MBEDTLS)
+    target_link_libraries(test_decode_tool PRIVATE ${SRSRAN4G_MBEDTLS})
+  endif()
+  target_link_libraries(test_decode_tool PRIVATE m pthread)
+else()
+  if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+    target_compile_definitions(test_decode_tool PRIVATE HAVE_LIQUID=1)
+    target_include_directories(test_decode_tool PRIVATE ${LIQUID_INCLUDE_DIR})
+    target_link_libraries(test_decode_tool PRIVATE ${LIQUID_LIBRARY})
+  endif()
+  target_link_libraries(test_decode_tool PRIVATE m)
 endif()
 
 target_link_libraries(5gone-rar-dos PRIVATE

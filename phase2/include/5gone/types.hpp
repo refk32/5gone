@@ -53,6 +53,17 @@ struct AttackConfig {
   std::string log_file{"/tmp/5gone_attacker.log"};
   std::string grant_bus{"/tmp/5gone_grants.jsonl"};
   bool dry_run{false};
+
+  // Step 4 loopback: single B210, cross-chain near-field (TX/RX A -> TX/RX B).
+  std::string tx_subdev{"A:A"};
+  std::string rx_subdev{"A:B"};
+  std::string tx_antenna{"TX/RX"};
+  std::string rx_antenna{"TX/RX"};
+  uint32_t loopback_iterations{3};
+  double loopback_window_ms{200.0};
+  std::string loopback_dump_path;      // optional: write RX window to cf32 for debugging
+  double loopback_tx_scale{5.0};       // scale applied to the TX marker burst
+  bool loopback_probe{true};           // run the TX RF / RSSI probe stages
 };
 
 using Sample = std::complex<float>;

@@ -54,6 +54,18 @@ Ofdm::Ofdm(double sample_rate, uint32_t scs_hz, uint16_t num_prbs)
     samples_per_slot_ = static_cast<uint32_t>(sps);
 }
 
+uint32_t Ofdm::cp_len(uint32_t symbol_in_subframe) const
+{
+    if (samples_per_cp_.empty()) return 0;
+    return samples_per_cp_[symbol_in_subframe % samples_per_cp_.size()];
+}
+
+uint32_t Ofdm::sym_len(uint32_t symbol_in_subframe) const
+{
+    if (samples_per_symbol_.empty()) return 0;
+    return samples_per_symbol_[symbol_in_subframe % samples_per_symbol_.size()];
+}
+
 std::vector<std::complex<float>> Ofdm::fft(const std::vector<std::complex<float>>& in) const
 {
 #ifdef HAVE_LIQUID
