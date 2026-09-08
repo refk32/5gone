@@ -40,9 +40,13 @@ mkdir -p "$BUILD"
 cd "$BUILD"
 
 export SRSRAN_BUILD="${SRSRAN_BUILD:-$ROOT/build/srsran_build}"
+export SRSRAN4G_PREFIX="${SRSRAN4G_PREFIX:-$ROOT/build/srsran4g-install}"
+export SRSRAN4G_BUILD="${SRSRAN4G_BUILD:-$ROOT/build/srsran4g}"
 cmake "$ROOT/phase2" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DSRSRAN_BUILD_DIR="$SRSRAN_BUILD"
+  -DSRSRAN_BUILD_DIR="$SRSRAN_BUILD" \
+  -DSRSRAN4G_PREFIX="$SRSRAN4G_PREFIX" \
+  -DSRSRAN4G_BUILD="$SRSRAN4G_BUILD"
 cmake --build . -j"$JOBS"
 
 echo ""

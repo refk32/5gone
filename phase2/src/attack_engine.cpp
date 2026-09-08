@@ -199,10 +199,10 @@ int AttackEngine::run_bus()
 
   std::size_t last_pos = 0;
   std::set<uint32_t> seen;
-  std::unique_ptr<RadioUhd> radio;
+  std::shared_ptr<RadioUhd> radio;
   if (!cfg_.dry_run) {
     try {
-      radio = std::make_unique<RadioUhd>(cfg_);
+      radio = std::make_shared<RadioUhd>(cfg_);
       radio->start_streaming();
       set_shared_radio(radio);
     } catch (const std::exception& e) {

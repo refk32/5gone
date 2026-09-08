@@ -1,4 +1,6 @@
 #include "5gone/rar_monitor.hpp"
+#include "5gone/nr_rar_decoder.hpp"
+#include "5gone/nr_constants.hpp"
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -85,11 +87,31 @@ std::vector<RarEvent> RarMonitor::load_grants_from_dataset(const std::string& da
   return load_grants_from_file(log_path);
 }
 
+// Maps the configured bandwidth/SCS to the number of active PRBs. For the lab
+// (20 MHz, 30 kHz) that is 51 PRBs; fall back to the project constant otherwise.
+static uint16_t bwp_prbs_from_cfg(const AttackConfig& cfg)
+{
+  const uint32_t scs = cfg.scs_khz ? cfg.scs_khz * 1000u : nr::scs_hz;
+  const double bw_hz = (cfg.bandwidth_mhz ? cfg.bandwidth_mhz : 20) * 1e6;
+  const uint16_t prbs = static_cast<uint16_t>(bw_hz / (12.0 * scs));
+  return (prbs > 0) ? prbs : nr::bwp_num_prbs;
+}
+
 std::vector<RarEvent> RarMonitor::scan_buffer(const SampleBuffer& iq) const
 {
-  (void)iq;
-  // Live PDCCH decode: requires srsRAN polar decoder + RA-RNTI blind search.
-  // Returns empty until DL sync + PDCCH pipeline completes (see docs/phase2-attack.md).
+  // Live DL RAR decode + log (receive-only, single B210).
+  // This is the ported 5GSniffer PDCCH chain: OFDM -> DM-RS correlation ->
+  // (polar decode when srsRAN-4G is linked) -> DCI 1_0 parse -> log.
+  //
+  // NOTE: returns an EMPTY event list on purpose. We only decode+log what the
+  // gNB broadcasts; we do NOT originate a RAR here, so nothing should reach
+  // execute_attack() (the TX/overshadow path).
+  const uint32_t scs = cfg_.scs_khz ? cfg_.scs_khz * 1000u : nr::scs_hz;
+  const uint16_t prbs = bwp_prbs_from_cfg(cfg_);
+
+  nr::RarDecoder decoder(cfg_.sample_rate, scs, cfg_.pci, prbs);
+  decoder.decode(iq);   // logs each observed RAR DCI to stdout
+
   return {};
 }
 

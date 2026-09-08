@@ -31,10 +31,19 @@ start_mongodb() {
   fi
 }
 
+have_open5gs_systemd() {
+  [ -f /lib/systemd/system/open5gs-amfd.service ] || [ -f /usr/lib/systemd/system/open5gs-amfd.service ]
+}
+
+# Daemon open5gs-amfd uses amf.yaml (not amfd.yaml).
+open5gs_yaml() {
+  local daemon="$1"
+  echo "$OPEN5GS_PREFIX/etc/open5gs/${daemon%d}.yaml"
+}
+
 start_open5gs() {
-  if systemctl list-unit-files open5gs-amfd.service >/dev/null 2>&1; then
+  if have_open5gs_systemd; then
     echo "    starting Open5GS via systemd..."
-    sudo systemctl start mongod
     sudo systemctl start open5gs-nrfd open5gs-scpd open5gs-amfd open5gs-smfd open5gs-upfd
     sudo systemctl start open5gs-ausfd open5gs-udmd open5gs-pcfd open5gs-nssfd open5gs-bsfd open5gs-udrd
     return
@@ -42,13 +51,29 @@ start_open5gs() {
 
   if [ -x "$OPEN5GS_PREFIX/bin/open5gs-amfd" ]; then
     echo "    starting Open5GS from $OPEN5GS_PREFIX ..."
+    if pgrep -x open5gs-amfd >/dev/null 2>&1; then
+      echo "    Open5GS already running"
+      return
+    fi
+    # NRF/SCP first so other NFs can register.
+    local started=0
     for svc in nrfd scpd amfd smfd upfd ausfd udmd pcfd nssfd bsfd udrd; do
-      bin="$OPEN5GS_PREFIX/bin/open5gs-${svc}"
-      cfg="$OPEN5GS_PREFIX/etc/open5gs/${svc}.yaml"
+      local bin="$OPEN5GS_PREFIX/bin/open5gs-${svc}"
+      local cfg
+      cfg="$(open5gs_yaml "$svc")"
       if [ -x "$bin" ] && [ -f "$cfg" ]; then
         "$bin" -c "$cfg" >> "$RUN/open5gs.log" 2>&1 &
+        started=$((started + 1))
+        sleep 0.2
+      else
+        echo "    skip ${svc}: missing $bin or $cfg"
       fi
     done
+    if [ "$started" -eq 0 ]; then
+      echo "Open5GS configs not found under $OPEN5GS_PREFIX/etc/open5gs/"
+      exit 1
+    fi
+    echo "    started $started NF processes (log: $RUN/open5gs.log)"
     return
   fi
 
@@ -76,33 +101,61 @@ stop_all() {
   fi
   rm -f "$RUN/gnb.pid"
   pkill -f "$GNB_BIN" 2>/dev/null || true
-  if systemctl list-unit-files open5gs-amfd.service >/dev/null 2>&1; then
+  if have_open5gs_systemd; then
     sudo systemctl stop open5gs-nrfd open5gs-scpd open5gs-amfd open5gs-smfd open5gs-upfd 2>/dev/null || true
     sudo systemctl stop open5gs-ausfd open5gs-udmd open5gs-pcfd open5gs-nssfd open5gs-bsfd open5gs-udrd 2>/dev/null || true
   else
-    pkill -f open5gs- 2>/dev/null || true
+    for d in nrfd scpd amfd smfd upfd ausfd udmd pcfd nssfd bsfd udrd; do
+      pkill -x "open5gs-${d}" 2>/dev/null || true
+    done
   fi
   echo "    stopped"
+}
+
+wait_for_amf() {
+  local i
+  # NGAP is SCTP, not TCP — ss -ltn will miss 38412.
+  for i in $(seq 1 25); do
+    if pgrep -x open5gs-amfd >/dev/null 2>&1 && \
+       ss -ln 2>/dev/null | grep -q ':38412'; then
+      echo "    AMF listening on :38412 (SCTP)"
+      return 0
+    fi
+    sleep 0.4
+  done
+  if pgrep -x open5gs-amfd >/dev/null 2>&1; then
+    echo "    AMF process up (open5gs-amfd) — NGAP is SCTP :38412"
+    return 0
+  fi
+  echo "    WARNING: AMF not running — see $RUN/open5gs.log"
+  return 0
 }
 
 status_all() {
   echo "MongoDB:"
   pgrep -a mongod || echo "  down"
   echo "Open5GS:"
-  pgrep -af open5gs || echo "  down"
+  pgrep -a open5gs-amfd || echo "  down"
+  pgrep -a 'open5gs-' 2>/dev/null | grep -v 'start-5g-native' || true
   echo "gNB:"
-  pgrep -af gnb || echo "  down"
+  pgrep -af "$GNB_BIN" || echo "  down"
   echo "B210:"
   uhd_find_devices 2>/dev/null || echo "  not found"
+  echo "AMF NGAP (SCTP :38412):"
+  ss -ln 2>/dev/null | grep 38412 || echo "  not listening"
+  echo "UPF:"
+  pgrep -a open5gs-upfd || echo "  down (need ogstun — sudo ip tuntap add name ogstun mode tun)"
 }
 
 cmd="${1:-status}"
 case "$cmd" in
   up)
     start_mongodb
+    OPEN5GS_AMF_YAML="$OPEN5GS_PREFIX/etc/open5gs/amf.yaml" \
+      OPEN5GS_NRF_YAML="$OPEN5GS_PREFIX/etc/open5gs/nrf.yaml" \
+      bash "$ROOT/scripts/patch-open5gs-plmn.sh" || true
     start_open5gs
-    sleep 5
-    bash "$ROOT/scripts/patch-open5gs-plmn.sh" 2>/dev/null || true
+    wait_for_amf
     start_gnb
     ;;
   down)
@@ -110,7 +163,11 @@ case "$cmd" in
     ;;
   core)
     start_mongodb
+    OPEN5GS_AMF_YAML="$OPEN5GS_PREFIX/etc/open5gs/amf.yaml" \
+      OPEN5GS_NRF_YAML="$OPEN5GS_PREFIX/etc/open5gs/nrf.yaml" \
+      bash "$ROOT/scripts/patch-open5gs-plmn.sh" || true
     start_open5gs
+    wait_for_amf
     ;;
   gnb)
     start_gnb

@@ -45,7 +45,7 @@ fi
 
 cd "$SRC"
 if [ ! -d build ]; then
-  meson setup build --prefix="$PREFIX" -Ddb_server=mongodb://127.0.0.1/open5gs
+  meson setup build --prefix="$PREFIX"
 fi
 meson compile -C build -j"$JOBS"
 meson install -C build
