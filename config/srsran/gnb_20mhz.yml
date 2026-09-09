@@ -16,10 +16,12 @@ cu_cp:
 
 ru_sdr:
   device_driver: uhd
-  device_args: type=b200,num_recv_frames=512,num_send_frames=512,master_clock_rate=23.04e6
+  # 8001640's TX output is silent (proven by own-chain loopback: 0.0 dB at all
+  # amplitudes). gNB therefore runs on "000000319" (chain A TX proven +28/+38 dB).
+  device_args: type=b200,serial=000000319,num_recv_frames=512,num_send_frames=512,master_clock_rate=23.04e6
   srate: 23.04
   otw_format: sc12
-  tx_gain: 80
+  tx_gain: 30       # near-field RX-lock step: audible at 2-5 cm. Dial back when a real UE attaches.
   rx_gain: 40
 
 cell_cfg:

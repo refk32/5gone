@@ -3,6 +3,8 @@
 #include "5gone/nr_ofdm.hpp"
 
 #include <cmath>
+#include <algorithm>
+
 
 namespace gone::nr {
 
@@ -140,6 +142,118 @@ std::vector<std::complex<float>> pss_sliding_corr(
             acc += std::conj(ref[k]) * iq[lag + k];
         out[lag] = acc;
     }
+    return out;
+}
+
+PssAcq acquire_pss(const std::vector<std::complex<float>>& rx,
+                   const std::vector<std::complex<float>>& ref,
+                   size_t from, size_t len, double sample_rate)
+{
+    PssAcq a;
+    const size_t R = ref.size();
+    if (R == 0 || rx.empty()) return a;
+    if (from + len > rx.size()) len = rx.size() - from;
+    if (len <= R) return a;
+
+    double er = 0.0;
+    for (const auto& v : ref) er += std::norm(v);
+
+    size_t best = 0;
+    double best_c = -1.0;
+    for (size_t k = 0; k + R <= len; ++k) {
+        std::complex<double> dot(0.0, 0.0);
+        double e = 0.0;
+        for (size_t j = 0; j < R; ++j) {
+            dot += std::conj(std::complex<double>(ref[j])) *
+                   std::complex<double>(rx[from + k + j]);
+            e += std::norm(std::complex<double>(rx[from + k + j]));
+        }
+        const double c = std::abs(dot) / (std::sqrt(er * e) + 1e-12);
+        if (c > best_c) { best_c = c; best = k; }
+    }
+
+    const size_t off = from + best;
+    a.offset = off;
+    a.corr = best_c;
+    a.found = a.corr >= 0.35;
+
+    // CFO from the two halves of the matched PSS body: the phase advance
+    // across R/2 samples is 2*pi*f*T_span.
+    const size_t H = R / 2;
+    std::complex<double> d1(0.0, 0.0), d2(0.0, 0.0);
+    for (size_t j = 0; j < H; ++j) {
+        d1 += std::conj(std::complex<double>(ref[j])) *
+              std::complex<double>(rx[off + j]);
+        d2 += std::conj(std::complex<double>(ref[H + j])) *
+              std::complex<double>(rx[off + H + j]);
+    }
+    if (std::abs(d1) > 1e-12 && std::abs(d2) > 1e-12) {
+        const double ph = std::arg(d2 * std::conj(d1));
+        const double span_sec = static_cast<double>(H) / sample_rate;
+        a.cfo_hz = ph / (2.0 * 3.14159265358979323846 * span_sec);
+        // The PSS itself is phase-flippable (attacker copy is -PSS): its phases
+        // cancel in the product d2*conj(d1), so `ph` is the pure CFO ramp.
+    }
+    return a;
+}
+
+static double pss_two_half_cfo(const std::vector<std::complex<float>>& rx,
+                               const std::vector<std::complex<float>>& ref,
+                               size_t off, double sample_rate)
+{
+    const size_t R = ref.size();
+    if (R < 4) return 0.0;
+    const size_t H = R / 2;
+    std::complex<double> d1(0.0, 0.0), d2(0.0, 0.0);
+    for (size_t j = 0; j < H; ++j) {
+        d1 += std::conj(std::complex<double>(ref[j])) *
+              std::complex<double>(rx[off + j]);
+        d2 += std::conj(std::complex<double>(ref[H + j])) *
+              std::complex<double>(rx[off + H + j]);
+    }
+    if (std::abs(d1) < 1e-12 || std::abs(d2) < 1e-12) return 0.0;
+    const double ph = std::arg(d2 * std::conj(d1));
+    const double span_sec = static_cast<double>(H) / sample_rate;
+    return ph / (2.0 * 3.14159265358979323846 * span_sec);
+}
+
+std::vector<PssPeak> pss_scan(const std::vector<std::complex<float>>& rx,
+                              const std::vector<std::complex<float>>& ref,
+                              float gate, double sample_rate)
+{
+    std::vector<PssPeak> out;
+    const size_t R = ref.size();
+    if (R == 0 || rx.size() < R) return out;
+
+    double er = 0.0;
+    for (const auto& v : ref) er += std::norm(v);
+    if (er <= 1e-12) return out;
+
+    const size_t n_corr = rx.size() - R + 1;
+    std::vector<float> corr(n_corr);
+    for (size_t k = 0; k < n_corr; ++k) {
+        std::complex<double> dot(0.0, 0.0);
+        double e = 0.0;
+        for (size_t j = 0; j < R; ++j) {
+            dot += std::conj(std::complex<double>(ref[j])) *
+                   std::complex<double>(rx[k + j]);
+            e += std::norm(std::complex<double>(rx[k + j]));
+        }
+        corr[k] = static_cast<float>(std::abs(dot) / (std::sqrt(er * e) + 1e-12));
+    }
+
+    for (size_t k = 0; k < n_corr; ++k) {
+        if (corr[k] < gate) continue;
+        const bool local = (k == 0 || corr[k] >= corr[k - 1]) &&
+                           (k + 1 == n_corr || corr[k] >= corr[k + 1]);
+        if (!local) continue;
+        out.push_back(PssPeak{k, corr[k],
+                              pss_two_half_cfo(rx, ref, k, sample_rate)});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const PssPeak& a, const PssPeak& b) { return a.corr > b.corr; });
+    constexpr size_t kMaxPeaks = 6;
+    if (out.size() > kMaxPeaks) out.resize(kMaxPeaks);
     return out;
 }
 

@@ -48,6 +48,8 @@ set(5GONE_SOURCES
   src/nr_pss.cpp
   # Loopback timing harness: TX->RX latency measurement (Step 4)
   src/latency.cpp
+  # Synthetic RAR-slot builder for the software-victim collision test (Step 4b)
+  src/nr_rar_tx.cpp
 )
 
 add_executable(5gone-rar-dos ${5GONE_SOURCES})
@@ -121,6 +123,36 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
   target_link_libraries(test_loopback PRIVATE ${LIQUID_LIBRARY})
 endif()
 target_link_libraries(test_loopback PRIVATE m)
+
+# --- Collision test (Step 4b) ---
+# Self-contained: no UHD, no srsRAN. Builds the synthetic RAR slot + a louder
+# conflicting copy, injects them into synthetic RX at known offsets, and checks
+# the same victim logic run_collide() uses sees one grant in control and a
+# duplicate when the attack overlaps the slot.
+set(COLLIDE_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_collide.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_tx.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/latency.cpp"
+)
+add_executable(test_collide ${COLLIDE_TEST_SRC})
+target_include_directories(test_collide PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_collide PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_collide PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_collide PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_collide PRIVATE m)
 
 # --- Old srsRAN 4G (srsRANRF) for the full PDCCH polar/CRC decode path ---
 # Gated behind GONE_HAVE_SRSRAN_OLD. When the old srsRAN_4G C API is available
@@ -342,6 +374,65 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
   target_link_libraries(analyze_lb PRIVATE ${LIQUID_LIBRARY})
 endif()
 target_link_libraries(analyze_lb PRIVATE m)
+
+# --- Collide RX dump analyzer (debug: per-symbol msg2 clarity under CFO/phase) ---
+set(ANALYZE_COLLIDE_SRC
+  "${CMAKE_SOURCE_DIR}/tools/analyze_collide.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_tx.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/latency.cpp"
+)
+add_executable(analyze_collide ${ANALYZE_COLLIDE_SRC})
+target_include_directories(analyze_collide PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(analyze_collide PRIVATE m)
+
+# --- Live RX probe (2-SDR PoC): lock the real gNB SSB on the attacker radio ---
+# Pure RX (no TX) on the configured chain. Reuses config.cpp + radio_uhd.cpp so
+# device serial / freq / gains come from rar_dos.yaml.
+set(RX_PROBE_SRC
+  "${CMAKE_SOURCE_DIR}/tools/rx_probe.cpp"
+  "${CMAKE_SOURCE_DIR}/src/config.cpp"
+  "${CMAKE_SOURCE_DIR}/src/radio_uhd.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+)
+add_executable(rx_probe ${RX_PROBE_SRC})
+target_include_directories(rx_probe PRIVATE include ${UHD_INCLUDE_DIRS})
+target_link_libraries(rx_probe PRIVATE UHD::UHD yaml-cpp ${CMAKE_THREAD_LIBS_INIT})
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(rx_probe PRIVATE HAVE_LIQUID=1)
+  target_include_directories(rx_probe PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(rx_probe PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(rx_probe PRIVATE m)
+
+# --- Live TX probe: "does this radio radiate at all?" (no srsRAN) ---
+set(TX_PROBE_SRC
+  "${CMAKE_SOURCE_DIR}/tools/tx_probe.cpp"
+  "${CMAKE_SOURCE_DIR}/src/config.cpp"
+  "${CMAKE_SOURCE_DIR}/src/radio_uhd.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+)
+add_executable(tx_probe ${TX_PROBE_SRC})
+target_include_directories(tx_probe PRIVATE include ${UHD_INCLUDE_DIRS})
+target_link_libraries(tx_probe PRIVATE UHD::UHD yaml-cpp ${CMAKE_THREAD_LIBS_INIT})
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(tx_probe PRIVATE HAVE_LIQUID=1)
+  target_include_directories(tx_probe PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(tx_probe PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(tx_probe PRIVATE m)
 
 set(DECODE_TEST_SRC
   "${CMAKE_SOURCE_DIR}/tests/test_decode_tool.cpp"

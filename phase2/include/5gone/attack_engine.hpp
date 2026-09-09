@@ -24,6 +24,7 @@ private:
   int run_live();
   int run_bus();
   int run_loopback();
+  int run_collide();
 
   void execute_attack(const RarEvent& ev);
 

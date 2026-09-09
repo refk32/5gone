@@ -60,4 +60,34 @@ std::vector<std::complex<float>> pss_sliding_corr(
     const std::vector<std::complex<float>>& iq,
     const std::vector<std::complex<float>>& ref);
 
+// A UE's SSB acquisition over one RX window: full-rate normalized correlation
+// of the PSS time-domain body against rx[from, from+len) — no decimation, so
+// timing is exact regardless of where the burst lands on the sample grid. Also
+// returns a coarse CFO estimate from the two-half phase ramp of the peak PSS.
+// `offset` is absolute in `rx` = where the PSS body (FFT payload, no CP) starts.
+struct PssAcq {
+    bool   found{false};
+    size_t offset{0};
+    double corr{0.0};
+    double cfo_hz{0.0};
+};
+PssAcq acquire_pss(const std::vector<std::complex<float>>& rx,
+                   const std::vector<std::complex<float>>& ref,
+                   size_t from, size_t len, double sample_rate);
+
+// Full-window PSS scan: normalized full-rate correlation over the WHOLE rx
+// buffer (no prediction — "wherever the SSB is, the UE finds it"), keeping the
+// local maxima above `gate` sorted by corr. Each peak carries the absolute
+// offset of the PSS body in `rx` plus a CFO estimate from its phase ramp.
+// Bounded to the strongest `kMaxPeaks` so a hijacker's extra copy surfaces as
+// a second peak.
+struct PssPeak {
+    size_t offset{0};
+    double corr{0.0};
+    double cfo_hz{0.0};
+};
+std::vector<PssPeak> pss_scan(const std::vector<std::complex<float>>& rx,
+                              const std::vector<std::complex<float>>& ref,
+                              float gate, double sample_rate = 23.04e6);
+
 } // namespace gone::nr

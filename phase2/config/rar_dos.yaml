@@ -1,17 +1,18 @@
 # 5Gone Phase 2 — RAR DoS attacker config
 # Aligned with config/srsran/gnb_20mhz.yml (n78, 20 MHz, PCI 1, 23.04 MSPS)
 
-mode: sim  # sim | inject | live | bus
+mode: sim  # sim | inject | live | bus | loopback | collide
 
 dry_run: false
 
 radio:
   sample_rate: 23040000
-  center_freq_hz: 3500000000  # adjust to match dl_arfcn 632628 in your band plan
+  center_freq_hz: 3489420000  # n78 dl_arfcn 632628 (real gNB) — matches srsRAN
   tx_gain: 80
   rx_gain: 40
   # Second B210 serial — gNB uses the first device
-  device_args: "type=b200,master_clock_rate=23.04e6,num_recv_frames=512,num_send_frames=512"
+  # 2-SDR PoC: attacker/victim owns "000000319"; gNB ("8001640") is srsRAN's.
+  device_args: "type=b200,serial=000000319,master_clock_rate=23.04e6,num_recv_frames=512,num_send_frames=512"
 
 cell:
   pci: 1
@@ -44,8 +45,21 @@ loopback:
   tx_antenna: "TX/RX"
   rx_antenna: "TX/RX"
   tx_scale: 5.0      # scale applied to the TX marker burst (boost near-field RX)
-  probe: false        # run TX RF/RSSI probe stages (set false for fast re-runs)
+  probe: true        # run TX RF/RSSI probe stages (set false for fast re-runs)
   # dump_path: /tmp/lb0.cf32   # set to write iter-0 RX window for offline inspection
+
+# Step 4b — software-victim RAR overshadow (--mode collide). No real gNB: we
+# synthesize the lab RAR slot (SSB + RAR PDCCH DM-RS + message-2 payload) and a
+# CONFLICTING louder copy, TX both on chain A, and score how a software victim
+# (RarDecoder + message-2 correlation) on chain B sees them. A clean RAR shows
+# one RAR PDCCH + one message-2 match; an overshadowed window shows two (or the
+# victim re-syncs to the hijacker's stronger SSB).
+collide:
+  iterations: 3
+  legit_scale: 2.0        # TX amplitude of the legit slot — low enough to avoid ADC clip
+  attack_scale: 2.0       # attack copy = 2*legit (2x louder already avoids clip; no DAC saturation)
+  delay_symbols: [1.0, 3.0, 6.0, 9.0]   # attack arrives this many OFDM symbols late
+  dump_path: /tmp/collide   # writes ctl.cf32 + att_d<N>_i<M>.cf32 windows (uncommented for offline analysis)
 
 paths:
   iq_template_dir: phase2/iq_templates

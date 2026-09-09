@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""rx_probe_ssb.py — locate the SSB in a cf32 capture by burstiness.
+
+The SSB (SSS/PSS/DMRS, 240 SC at 30 kHz) is transmitted periodically (every
+5/10/20 ms) on the first symbols of its slots, while PDSCH/PDCCH fill the DL
+continuously. So SSB subcarriers are the bins whose power varies strongly over
+time (max/mean >> 1), clustered near the SSB center.
+
+Prints, per slot-window (768-sample FFT every 11520 samples = 0.5 ms):
+  - the bursty-bin cluster center -> SSB center frequency (MHz)
+  - the PSS bin offset = SSB_center_bin - 119 (== 119 is the SSB's own center;
+    our fixed pss ref centers PSS at bin ~119 of the FFT). That delta is the
+    frequency shift pss_time_reference must apply around carrier for a hit.
+
+usage: python3 rx_probe_ssb.py <file.cf32> [sample_rate=23.04e6] [carrier_mhz]
+"""
+import sys
+import numpy as np
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/real_gnb.cf32"
+    srate = float(sys.argv[2]) if len(sys.argv) > 2 else 23.04e6
+    fc_mhz = float(sys.argv[3]) if len(sys.argv) > 3 else 3489.42
+
+    W = 768
+    stride = 11520          # 0.5 ms slot at 30 kHz SCS (14 syms + CPs)
+    iq = np.fromfile(path, dtype=np.complex64)
+    n = (len(iq) // stride) * stride
+    iq = iq[:n]
+    nwin = n // stride
+    print(f"{path}: {n} samples = {n/srate*1e3:.0f} ms, {nwin} slot-windows")
+
+    m = iq[:nwin * W].reshape(nwin, W)
+    win = np.hanning(W).astype(np.float32)
+    spec = np.abs(np.fft.fft(m * win, axis=1)) ** 2
+    k = np.fft.fftfreq(W, 1.0 / srate)
+
+    mean_p = spec.mean(axis=0)
+    floor = np.percentile(mean_p, 5)
+    burst = spec.max(axis=0) / (mean_p + 1e-30)
+
+    hot = np.where((burst > 3.0) & (mean_p > 3 * floor))[0]
+    hot = hot[hot < W // 2]  # positive-frequency half only
+    best_burst, best_bin = 0.0, -1
+    print("  bin   f(MHz)   burst   mean(dB rel)  span(+-3)")
+    for i in range(len(hot)):
+        b = int(hot[i])
+        span = sum(1 for j in hot if -3 <= int(j) - b <= 3)
+        mdb = 10*np.log10(mean_p[b] / floor + 1e-12)
+        print(f"{b:5d}  {fc_mhz + k[b]/1e6:8.3f}  {burst[b]:5.1f}  {mdb:8.1f}  {span}")
+        if span >= 4 and burst[b] > best_burst:
+            best_burst, best_bin = burst[b], b
+
+    if best_bin < 0:
+        print("NO bursty SSB cluster found: no periodic SSB above the noise floor.")
+        print("Either the gNB is not radiating, or the RX freq/antenna is wrong.")
+        return
+
+    hub = int(best_bin)
+    cluster = [j for j in hot if abs(int(j) - hub) <= 8]
+    center = int(round(np.mean(cluster)))
+    delta = center - 119
+    print(f"\nSSB burst cluster center: bin {center} -> {fc_mhz + k[center]/1e6:.3f} MHz")
+    print(f"PSS bin offset vs our ref: delta = {delta:+d} bins ({delta*0.03:+.2f} MHz)")
+
+if __name__ == "__main__":
+    main()

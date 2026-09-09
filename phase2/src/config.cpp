@@ -73,6 +73,20 @@ AttackConfig load_config(const std::string& yaml_path)
     cfg.loopback_probe = yaml_bool(lb, "probe", cfg.loopback_probe);
   }
 
+  if (root["collide"]) {
+    const auto& c = root["collide"];
+    cfg.collide_iterations = c["iterations"]
+        ? c["iterations"].as<uint32_t>() : cfg.collide_iterations;
+    cfg.collide_legit_scale = yaml_dbl(c, "legit_scale", cfg.collide_legit_scale);
+    cfg.collide_attack_scale = yaml_dbl(c, "attack_scale", cfg.collide_attack_scale);
+    cfg.collide_dump_path = yaml_str(c, "dump_path", cfg.collide_dump_path);
+    if (c["delay_symbols"] && c["delay_symbols"].IsSequence()) {
+      std::vector<double> deltas;
+      for (const auto& d : c["delay_symbols"]) deltas.push_back(d.as<double>());
+      if (!deltas.empty()) cfg.collide_delay_symbols = std::move(deltas);
+    }
+  }
+
   if (root["paths"]) {
     const auto& p = root["paths"];
     cfg.iq_template_dir = yaml_str(p, "iq_template_dir", cfg.iq_template_dir);
@@ -110,7 +124,7 @@ AttackConfig load_config_with_overrides(const std::string& yaml_path, int argc, 
       cfg.loopback_iterations = static_cast<uint32_t>(std::stoul(argv[++i]));
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       std::cout << "5gone-rar-dos — RAR DoS uplink overshadow (Section 4.1)\n"
-                << "  --mode sim|inject|live|bus|loopback\n"
+                << "  --mode sim|inject|live|bus|loopback|collide\n"
                 << "  --grant FILE.json\n"
                 << "  --dataset DIR\n"
                 << "  --device UHD_ARGS\n"
