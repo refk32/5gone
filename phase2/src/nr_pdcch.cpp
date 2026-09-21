@@ -58,14 +58,18 @@ void Pdcch::initialize_dmrs_seq()
         const uint8_t al = static_cast<uint8_t>(1u << agg_level);
 
         const auto dmrs_rb = get_rb_candidates(al, (uint8_t)candidate_idx, max_num_candidate, slot_index, user_search_space);
-        // DMRS SC indices (relative to CORESET span)
+        // DMRS SC indices within the BWP. `rb` is CORESET-relative (0..freq-1);
+        // coreset_info.start_prb puts the CORESET at its real position inside
+        // the BWP. dmrs_gold_idx below stays CORESET-relative (it only indexes
+        // the gold sequence, whose length is independent of position).
         std::vector<uint64_t> dmrs_sc;
         std::vector<uint16_t> data_sc;
         const std::vector<uint16_t> dmrs_per_rb = {1, 5, 9};
         const std::vector<uint16_t> data_per_rb = {0, 2, 3, 4, 6, 7, 8, 10, 11};
         for (uint16_t rb : dmrs_rb) {
-          for (uint16_t d : dmrs_per_rb) dmrs_sc.push_back(12u * rb + d);
-          for (uint16_t d : data_per_rb) data_sc.push_back(12u * rb + d);
+          const uint16_t rb_abs = static_cast<uint16_t>(rb + coreset_info.start_prb);
+          for (uint16_t d : dmrs_per_rb) dmrs_sc.push_back(12u * rb_abs + d);
+          for (uint16_t d : data_per_rb) data_sc.push_back(12u * rb_abs + d);
         }
 
         // Gold-sequence DMRS symbol indices (length = per RB * 3)
@@ -143,7 +147,11 @@ std::vector<Dci> Pdcch::process(std::vector<Symbol>& symbols, int64_t metadata)
             // AL 8 / 16: SI/RA mode with RNTI=0 + repetition optimization.
             aux.rnti = 0;
             int outp = decode_pdcch(symbol, equalized, aux, true, metadata, symbol_in_chunk);
-            if (outp == 1 && aux.found_aggregation_level > 1) {
+            // Keep EVERY successful decode, including AL 1: an earlier
+            // `> 1` gate silently dropped all AL-1 successes (returning only
+            // their correlation shells), which made every weak-but-decodable
+            // real RAR — the level every OTA capture hits at — vanish.
+            if (outp == 1 && aux.found_aggregation_level >= 1) {
               delete_lower_AL_dcis(aux.pdcch_scrambling_id, aux.n_slot, aux.n_ofdm,
                                    aux.found_candidate, aux.found_aggregation_level, found_dci_list);
               decoded.push_back(aux);
@@ -155,7 +163,7 @@ std::vector<Dci> Pdcch::process(std::vector<Symbol>& symbols, int64_t metadata)
             for (int rnti_i = 0; rnti_i < limit; ++rnti_i) {
               aux.rnti = found_rnti_list_[rnti_i];
               int outp = decode_pdcch(symbol, equalized, aux, false, metadata, symbol_in_chunk);
-              if (outp == 1 && aux.found_aggregation_level > 1) {
+              if (outp == 1 && aux.found_aggregation_level >= 1) {
                 found_dci = true;
                 decoded.push_back(aux);
                 break;
@@ -165,6 +173,25 @@ std::vector<Dci> Pdcch::process(std::vector<Symbol>& symbols, int64_t metadata)
           if (found_dci) break;
         }
       }
+    }
+
+    // Even with the srsRAN_4G polar decoder enabled, a strong DM-RS correlation
+    // that fails polar/CRC is still a confident RAR observation ("where the RAR
+    // is"). Keep every detected candidate that did not decode so callers that
+    // count RAR PDCCH observations (e.g. the collide victim) see it regardless
+    // of whether the DCI bits come back.
+    for (const auto& d : found_dci_list) {
+      bool dup = false;
+      for (const auto& done : decoded) {
+        if (done.pdcch_scrambling_id == d.pdcch_scrambling_id &&
+            done.found_aggregation_level == d.found_aggregation_level &&
+            done.found_candidate == d.found_candidate &&
+            done.n_slot == d.n_slot && done.n_ofdm == d.n_ofdm) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) decoded.push_back(d);
     }
   }
   return decoded;
@@ -226,6 +253,16 @@ bool Pdcch::correlate_DMRS(Symbol& symbol, std::vector<Dci>& found_dci_list)
     for (int agg_level = 0; agg_level < NUM_ALs; ++agg_level) {
       const uint8_t max_num_candidate = coreset_info.candidates_search_space[agg_level];
       for (int candidate_idx = 0; candidate_idx < max_num_candidate; ++candidate_idx) {
+        // A symbol only carries DM-RS if it lies inside the CORESET span
+        // [starting_ofdm_symbol_within_slot, +duration). Symbols outside the
+        // span can't correlate against any candidate.
+        const uint8_t dur_idx = symbol.symbol_index >= coreset_info.starting_ofdm_symbol_within_slot
+                                    ? static_cast<uint8_t>(symbol.symbol_index - coreset_info.starting_ofdm_symbol_within_slot)
+                                    : 0xFF;
+        if (coreset_info.duration == 0 || dur_idx >= coreset_info.duration) {
+          continue;
+        }
+
         const std::string key = std::to_string(pdcch_scrambling_id) + std::to_string(agg_level) +
                                 std::to_string(symbol.slot_index) + std::to_string(candidate_idx);
 
@@ -240,8 +277,21 @@ bool Pdcch::correlate_DMRS(Symbol& symbol, std::vector<Dci>& found_dci_list)
           rx_dmrs[i] = (idx < symbol.samples.size()) ? symbol.samples[idx] : std::complex<float>(0, 0);
         }
 
+        // The reference sequence is stacked dur_idx 0..duration-1 (each block
+        // one OFDM symbol's worth of DM-RS). Slice the current symbol's block
+        // so rx_dmrs and the reference have the same length (duration>1).
+        const size_t per_sym = coreset_info.duration
+                                   ? it_seq->second.size() / coreset_info.duration
+                                   : it_seq->second.size();
+        if (per_sym == 0 || per_sym != it_sc->second.size()) {
+          continue;
+        }
+        const size_t ref_begin = static_cast<size_t>(dur_idx) * per_sym;
+        const std::vector<std::complex<float>> ref_slice(it_seq->second.begin() + ref_begin,
+                                                        it_seq->second.begin() + ref_begin + per_sym);
+
         std::vector<float> corr_out;
-        correlate_magnitude_normalized(corr_out, rx_dmrs, it_seq->second);
+        correlate_magnitude_normalized(corr_out, rx_dmrs, ref_slice);
         const float corr = corr_out.empty() ? 0.0f : corr_out[0];
 
         if (corr > AL_corr_thresholds[agg_level]) {
@@ -279,7 +329,25 @@ std::vector<std::complex<float>> Pdcch::estimate_channel_dci(Symbol& symbol, con
 
   const uint64_t sc_start = it_data->second.empty() ? 0 : it_data->second.front();
   const uint64_t sc_end = it_data->second.empty() ? 0 : it_data->second.back();
-  symbol.channel_estimate(it_seq->second, it_sc->second, sc_start, sc_end);
+
+  // Same per-symbol slicing as correlate_DMRS: the stacked reference covers the
+  // whole CORESET duration; use only this DCI's symbol's block (duration>1).
+  const uint8_t dur_idx = dci_.n_ofdm >= coreset_info.starting_ofdm_symbol_within_slot
+                              ? static_cast<uint8_t>(dci_.n_ofdm - coreset_info.starting_ofdm_symbol_within_slot)
+                              : 0xFF;
+  if (coreset_info.duration == 0 || dur_idx >= coreset_info.duration) {
+    return {};
+  }
+  const size_t per_sym = coreset_info.duration
+                             ? it_seq->second.size() / coreset_info.duration
+                             : it_seq->second.size();
+  if (per_sym == 0 || per_sym != it_sc->second.size()) {
+    return {};
+  }
+  const size_t ref_begin = static_cast<size_t>(dur_idx) * per_sym;
+  const std::vector<std::complex<float>> ref_slice(it_seq->second.begin() + ref_begin,
+                                                   it_seq->second.begin() + ref_begin + per_sym);
+  symbol.channel_estimate(ref_slice, it_sc->second, sc_start, sc_end);
 
   std::vector<std::complex<float>> out;
   out.reserve(it_data->second.size());
@@ -375,7 +443,15 @@ std::vector<uint16_t> Pdcch::get_rb_candidates(uint8_t aggregation_level, uint8_
       if (pos < rb_interleaved.size()) rb_idx_candidates.push_back(rb_interleaved[pos]);
     }
   }
+  // The flat REG index encodes (symbol-layer * bw) + CORESET-PRB (see
+  // get_rb_interleaved). PDCCH DM-RS occupies the SAME PRBs in every symbol of
+  // a duration>1 CORESET, so reduce to the unique CORESET-relative PRB set;
+  // otherwise symbol-layer bytes masquerade as +bw BWP PRBs and address SCs
+  // past the BWP edge (the R1/B duration-2 bug).
+  for (uint16_t& rb : rb_idx_candidates) rb %= coreset_info.frequency_domain_resources;
   std::sort(rb_idx_candidates.begin(), rb_idx_candidates.end());
+  rb_idx_candidates.erase(std::unique(rb_idx_candidates.begin(), rb_idx_candidates.end()),
+                          rb_idx_candidates.end());
   return rb_idx_candidates;
 }
 
@@ -387,7 +463,7 @@ std::vector<uint64_t> Pdcch::get_dmrs_sc_indices(uint8_t aggregation_level, uint
   std::vector<uint64_t> sc;
   sc.reserve(aggregation_level * DMRS_SC_CCE);
   for (uint16_t rb : rb_dmrs_idx)
-    for (uint16_t d : dmrs_per_rb) sc.push_back(12u * rb + d);
+    for (uint16_t d : dmrs_per_rb) sc.push_back(12u * (uint64_t)(rb + coreset_info.start_prb) + d);
   return sc;
 }
 
@@ -399,7 +475,7 @@ std::vector<uint16_t> Pdcch::get_data_sc_indices(uint8_t aggregation_level, uint
   std::vector<uint16_t> sc;
   sc.reserve(aggregation_level * 3 * DMRS_SC_CCE);
   for (uint16_t rb : rb_data_idx)
-    for (uint16_t d : data_per_rb) sc.push_back(12u * rb + d);
+    for (uint16_t d : data_per_rb) sc.push_back(12u * (uint16_t)(rb + coreset_info.start_prb) + d);
   return sc;
 }
 

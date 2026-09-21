@@ -1,272 +1,173 @@
-// // #include "srsran/phy/upper/channel_processors/pdcch_processor.h"
-// // // #include "srsran/phy/upper/channel_processors/pdcch/pdcch_dci_packing.h"
-// // #include "srsran/ran/pdcch/dci_packing.h"
-// // #include "srsran/phy/upper/channel_processors/pdsch/pdsch_processor.h"
-// // #include "srsran/fapi_adaptor/mac/messages/pdcch.h"
-// // #include "srsran/mac/mac_pdu_format.h"
-// // #include "srsran/support/units.h"
-// // #include <span>
-// // #include <vector>
-// // #include <iostream>
+#include "5gone/nr_rar_decoder.hpp"
 
-// // struct mac_rar_result {
-// //   uint16_t timing_advance;
-// //   uint32_t ul_grant;
-// //   uint16_t temp_c_rnti;
-// //   bool     found = false;
-// // };
+#include "5gone/nr_constants.hpp"
+#include "5gone/nr_ofdm.hpp"
+#include "5gone/nr_coreset.hpp"
+#include "5gone/nr_pdcch.hpp"
+#include "5gone/nr_dci.hpp"
+#include "5gone/nr_symbol.hpp"
+#include "5gone/nr_pdsch.hpp"
+#include "5gone/mac_rar.hpp"
 
-// // // Main processing function linking Steps 1 to 4
-// // bool process_msg2_rar(
-// //     const std::vector<srsran::log_likelihood_ratio>& pdcch_llrs,
-// //     const std::vector<srsran::log_likelihood_ratio>& pdsch_llrs,
-// //     uint16_t ra_rnti,
-// //     uint8_t target_rapid,
-// //     mac_rar_result& out_rar)
-// // {
-// //   // =========================================================================
-// //   // STEP 1: Decode PDCCH (Control Channel)
-// //   // =========================================================================
-// //   srsran::pdcch_processor pdcch_proc;
-// //   srsran::pdcch_processor::cfg_t pdcch_cfg{};
-  
-// //   pdcch_cfg.rnti = srsran::to_rnti(ra_rnti);
-// //   pdcch_cfg.dci_format = srsran::dci_format::FORMAT_1_0;
-// //   pdcch_cfg.payload_len = 39; // Fallback DCI Format 1_0 payload length in bits
+#include <cstdio>
 
-// //   srsran::bounded_bit_buffer<srsran::units::bits(64)> raw_dci_bits;
+namespace gone::nr {
 
-// //   bool pdcch_ok = pdcch_proc.decode(
-// //       raw_dci_bits,
-// //       srsran::span<const srsran::log_likelihood_ratio>(pdcch_llrs),
-// //       pdcch_cfg
-// //   );
+RarDecoder::RarDecoder(double sample_rate, uint32_t scs_hz, uint16_t pci, uint16_t bwp_prbs,
+                       bool verbose)
+    : sample_rate_(sample_rate), scs_hz_(scs_hz), pci_(pci), bwp_prbs_(bwp_prbs), verbose_(verbose)
+{
+    // --- Step 5: OFDM demodulator sized to 23.04 MHz / 30 kHz / 51 PRB ---
+    ofdm_ = new Ofdm(sample_rate_, scs_hz_, bwp_prbs_);
 
-// //   if (!pdcch_ok) {
-// //     std::cerr << "[Step 1 Failed] PDCCH polar decoding or RA-RNTI CRC unmasking failed.\n";
-// //     return false;
-// //   }
+    // --- Step 6/7: CORESET + PDCCH blind decoder over the full BWP, CSS ---
+    Coreset cs;
+    cs.frequency_domain_resources = bwp_prbs_;
+    cs.duration = 1;                          // 1-symbol CORESET
+    cs.cell_id = pci_;                        // DM-RS scrambling id = PCI
+    cs.starting_ofdm_symbol_within_slot = 0;
+    cs.num_symbols_per_slot = symbols_per_slot;   // 14
+    cs.num_slots_per_frame = slots_per_frame;     // 20
+    cs.candidates_search_space = {1, 2, 4, 8, 16};
 
-// //   // =========================================================================
-// //   // STEP 2: Unpack DCI Parameters for PDSCH Demodulation
-// //   // =========================================================================
-// //   srsran::dci_format_1_0_rar dci_payload{};
-// //   srsran::unpack_dci_1_0_rar(dci_payload, raw_dci_bits);
+    pdcch_ = new Pdcch();
+    pdcch_->set_coreset_info(cs);
+    pdcch_->scrambling_id_start = pci_;
+    pdcch_->scrambling_id_end   = pci_;        // only watch our cell
+    pdcch_->rnti_start = ra_rnti_min;          // 1
+    pdcch_->rnti_end   = ra_rnti_max;          // 71  (RA-RNTI range)
+    pdcch_->dci_sizes_list = { (uint8_t)dci_format10_bits(bwp_prbs_) };  // 39 @ 51 RB
 
-// //   // Configure PDSCH decoding parameters using extracted DCI values
-// //   srsran::pdsch_processor::grant_t pdsch_grant{};
-// //   pdsch_grant.rnti = srsran::to_rnti(ra_rnti);
-// //   pdsch_grant.freq_allocation = dci_payload.freq_alloc;
-// //   pdsch_grant.time_allocation = dci_payload.time_alloc;
-// //   pdsch_grant.mcs = dci_payload.mcs;
-// //   pdsch_grant.rv = 0; // Standard initial transmission RV for RAR
+    // With srsRAN_4G present we also recover the DCI bits; without it we rely on
+    // DM-RS correlation only (still finds + logs where the RAR is).
+#ifdef GONE_HAVE_SRSRAN_OLD
+    pdcch_->decode_enabled = true;
+#else
+    pdcch_->decode_enabled = false;
+#endif
 
-// //   // =========================================================================
-// //   // STEP 3: Decode PDSCH to Extract Raw Transport Block Bytes
-// //   // =========================================================================
-// //   srsran::pdsch_processor pdsch_proc;
-// //   std::vector<uint8_t> mac_tb_bytes(128); // Buffer for raw MAC Transport Block
+    if (verbose_) {
+        std::printf("[rar-dl] RarDecoder: %.2f MHz, %u kHz, PCI %u, BWP %u PRB, DCI1_0=%u bits, decode=%s\n",
+                    sample_rate_ / 1e6, scs_hz_ / 1000u, (unsigned)pci_, (unsigned)bwp_prbs_,
+                    (unsigned)dci_format10_bits(bwp_prbs_), pdcch_->decode_enabled ? "on (srsRAN-4G)" : "correlation-only");
+    }
 
-// //   srsran::pdsch_processor::decoding_result pdsch_result = pdsch_proc.decode(
-// //       srsran::span<uint8_t>(mac_tb_bytes),
-// //       srsran::span<const srsran::log_likelihood_ratio>(pdsch_llrs),
-// //       pdsch_grant
-// //   );
+    pdcch_->initialize_dmrs_seq();   // precompute reference sequences (Step 7)
 
-// //   if (!pdsch_result.tb_crc_ok) {
-// //     std::cerr << "[Step 3 Failed] PDSCH LDPC decoding or Transport Block CRC failed.\n";
-// //     return false;
-// //   }
+    // --- PDSCH decoder (recover the RAR's DL-SCH transport block from the grid) ---
+    pdsch_ = new Pdsch(sample_rate_, scs_hz_, pci_, bwp_prbs_, verbose_);
+}
 
-// //   // Resizing buffer to actual decoded Transport Block size
-// //   mac_tb_bytes.resize(pdsch_result.tb_len_bytes);
+RarDecoder::~RarDecoder()
+{
+    delete ofdm_;
+    delete pdcch_;
+    delete pdsch_;
+}
 
-// //   // =========================================================================
-// //   // STEP 4: Parse MAC Subheaders & Extract Target RAR Payload
-// //   // =========================================================================
-// //   size_t offset = 0;
-// //   while (offset < mac_tb_bytes.size()) {
-// //     uint8_t header_byte = mac_tb_bytes[offset];
-// //     bool extension = (header_byte & 0x80) != 0;
-// //     bool type_bit  = (header_byte & 0x40) != 0; // 1 = RAPID header, 0 = BI header
+std::vector<RarDciObs> RarDecoder::decode(const std::vector<std::complex<float>>& iq,
+                                          uint32_t starting_slot_in_frame,
+                                          double cfo_hz)
+{
+    // Step 0: optional residual-carrier-offset correction before demodulation.
+    //           s(t) = s(t) * exp(-j*2*pi*f_cfo*t)
+    std::vector<std::complex<float>> corrected = iq;
+    if (cfo_hz != 0.0) {
+        const double twopi_f = 2.0 * 8.0 * std::atan(1.0) * cfo_hz / sample_rate_;
+        const std::complex<double> step(std::cos(twopi_f), -std::sin(twopi_f));
+        std::complex<double> phasor(1.0, 0.0);
+        for (auto& s : corrected) {
+            const std::complex<float> c(s);
+            s = std::complex<float>(
+                static_cast<float>(c.real() * phasor.real() - c.imag() * phasor.imag()),
+                static_cast<float>(c.real() * phasor.imag() + c.imag() * phasor.real()));
+            phasor *= step;
+        }
+    }
 
-// //     if (!type_bit) {
-// //       // Backoff Indicator (BI) subheader (1 byte)
-// //       offset += 1;
-// //     } else {
-// //       // RAPID subheader (1 byte)
-// //       uint8_t rapid = header_byte & 0x3F;
-// //       offset += 1;
+    // Step 1: OFDM demodulate the raw IQ samples into frequency-domain Symbols.
+    auto symbols = ofdm_->demodulate(corrected, starting_slot_in_frame);
 
-// //       if (rapid == target_rapid) {
-// //         // Target RAPID found -> extract 7-byte MAC RAR body
-// //         if (offset + 7 > mac_tb_bytes.size()) {
-// //           std::cerr << "[Step 4 Failed] Corrupted RAR payload length.\n";
-// //           return false;
-// //         }
+    // Step 2: run the PDCCH blind decode (DM-RS correlation; polar decode if srsRAN).
+    auto found = pdcch_->process(symbols, 0);
 
-// //         const uint8_t* rar_ptr = &mac_tb_bytes[offset];
+    std::vector<RarDciObs> out;
+    out.reserve(found.size());
 
-// //         // 11-bit Timing Advance
-// //         out_rar.timing_advance = ((uint16_t)(rar_ptr[0] & 0x7F) << 4) | ((rar_ptr[1] & 0xF0) >> 4);
-        
-// //         // 27-bit Uplink Grant for Msg3
-// //         out_rar.ul_grant = ((uint32_t)(rar_ptr[1] & 0x0F) << 23) |
-// //                            ((uint32_t)(rar_ptr[2]) << 15) |
-// //                            ((uint32_t)(rar_ptr[3]) << 7) |
-// //                            ((uint32_t)(rar_ptr[4] & 0xFE) >> 1);
+    for (const auto& d : found) {
+        RarDciObs obs;
+        obs.aggregation_level = d.found_aggregation_level;
+        obs.slot    = d.n_slot;
+        obs.symbol  = d.n_ofdm;
+        obs.candidate = d.found_candidate;
+        obs.correlation = d.correlation;
+        obs.rnti = d.rnti;
 
-// //         // 16-bit Temporary C-RNTI
-// //         out_rar.temp_c_rnti = ((uint16_t)rar_ptr[5] << 8) | rar_ptr[6];
-// //         out_rar.found = true;
-// //         return true;
-// //       }
+        // Step 3: if we have the decoded payload bits, parse the DCI 1_0 fields.
+        if (d.crc_ok && !d.payload.empty()) {
+            DciFormat10 dci = DciFormat10::parse(d.payload, bwp_prbs_);
+            obs.decoded_bits = dci.valid;
+            if (dci.valid) {
+                obs.rb_start = dci.n_start_prb;
+                obs.rb_len   = dci.n_length_prb;
+                obs.mcs      = dci.mcs;
+                obs.harq     = dci.harq_process_number;
 
-// //       // Skip this non-matching RAR payload (7 bytes)
-// //       offset += 7;
-// //     }
+                // Step 4: recover the RAR PDSCH payload from the slot grid.
+                // sym0 = symbol index in `symbols` where symbol 0 of THIS slot sits.
+                int sym0 = -1;
+                for (size_t i = 0; i < symbols.size(); ++i) {
+                    if (symbols[i].slot_index == d.n_slot && symbols[i].symbol_index == 0) {
+                        sym0 = (int)i;
+                        break;
+                    }
+                }
+                if (sym0 >= 0) {
+                    obs.slot_start_sample = symbols[sym0].sample_index;
+                    PdschTb tb = pdsch_->demodulate(symbols, (uint32_t)sym0, dci, d.rnti);
+                    if (tb.valid && !tb.tb_bytes.empty()) {
+                        MacRar rar = parse_mac_rar(tb.tb_bytes);
+                        if (rar.valid) {
+                            obs.rar_parsed      = true;
+                            obs.rapid           = rar.rapid;
+                            obs.timing_advance  = rar.timing_advance;
+                            obs.t_c_rnti        = rar.t_c_rnti;
+                            obs.ul_grant        = rar.ul_grant;
+                        }
+                    }
+                }
+            }
+        }
 
-// //     if (!extension) break; // Last subheader reached
-// //   }
+        // Log what we observed (this is the "live, DL-decode + log" deliverable).
+        if (obs.decoded_bits) {
+            std::printf("[rar-dl] RAR DCI: RNTI=%u AL=%u slot=%u sym=%u cand=%u corr=%.3f "
+                        "PDSCH RB[%u..%u) len=%u MCS=%u HARQ=%u\n",
+                        (unsigned)obs.rnti, (unsigned)obs.aggregation_level,
+                        (unsigned)obs.slot, (unsigned)obs.symbol, (unsigned)obs.candidate,
+                        obs.correlation, (unsigned)obs.rb_start,
+                        (unsigned)(obs.rb_start + obs.rb_len), (unsigned)obs.rb_len,
+                        (unsigned)obs.mcs, (unsigned)obs.harq);
+            if (obs.rar_parsed) {
+                std::printf("[rar-mac] RAPID=%u TA=%u TempC-RNTI=%u UL-grant=",
+                            (unsigned)obs.rapid, (unsigned)obs.timing_advance,
+                            (unsigned)obs.t_c_rnti);
+                for (uint8_t b : obs.ul_grant) std::printf("%02X", (unsigned)b);
+                std::printf(" (%zu B)\n", obs.ul_grant.size());
+            } else {
+                std::printf("[rar-mac] PDSCH decode: No RAR subPDU (DL-SCH CRC fail or non-RAR TB)\n");
+            }
+        } else if (verbose_) {
+            std::printf("[rar-dl] RAR PDCCH detected by DM-RS correlation: AL=%u slot=%u sym=%u "
+                        "cand=%u corr=%.3f (decode disabled: build with srsRAN-4G for DCI bits)\n",
+                        (unsigned)obs.aggregation_level, (unsigned)obs.slot, (unsigned)obs.symbol,
+                        (unsigned)obs.candidate, obs.correlation);
+        }
 
-// //   std::cerr << "[Step 4 Failed] Target RAPID " << (int)target_rapid << " not found in MAC PDU.\n";
-// //   return false;
-// // }
+        out.push_back(obs);
+    }
 
-// #include "srsran/phy/upper/channel_processors/pdcch_processor.h"
-// #include "srsran/phy/upper/channel_processors/pdsch/pdsch_processor.h"
-// #include "srsran/ran/pdcch/dci_packing.h"
-// #include "srsran/mac/mac_pdu_format.h"
-// #include "srsran/support/units.h"
-// #include <span>
-// #include <vector>
-// #include <iostream>
+    return out;
+}
 
-// struct mac_rar_result {
-//   uint16_t timing_advance;
-//   uint32_t ul_grant;
-//   uint16_t temp_c_rnti;
-//   bool     found = false;
-// };
-
-// // Main processing pipeline connecting Steps 1 through 4
-// bool process_msg2_rar(
-//     const std::vector<srsran::log_likelihood_ratio>& pdcch_llrs,
-//     const std::vector<srsran::log_likelihood_ratio>& pdsch_llrs,
-//     uint16_t ra_rnti,
-//     uint8_t target_rapid,
-//     mac_rar_result& out_rar)
-// {
-//   // =========================================================================
-//   // STEP 1: Decode PDCCH (Control Channel)
-//   // =========================================================================
-//   srsran::pdcch_processor pdcch_proc;
-//   srsran::pdcch_processor::cfg_t pdcch_cfg{};
-  
-//   pdcch_cfg.rnti = srsran::to_rnti(ra_rnti);
-//   pdcch_cfg.dci_format = srsran::dci_format::FORMAT_1_0;
-//   pdcch_cfg.payload_len = 39; // Fallback DCI Format 1_0 payload length in bits
-
-//   srsran::bounded_bit_buffer<srsran::units::bits(64)> raw_dci_bits;
-
-//   bool pdcch_ok = pdcch_proc.decode(
-//       raw_dci_bits,
-//       srsran::span<const srsran::log_likelihood_ratio>(pdcch_llrs),
-//       pdcch_cfg
-//   );
-
-//   if (!pdcch_ok) {
-//     std::cerr << "[Step 1 Failed] PDCCH polar decoding or RA-RNTI CRC unmasking failed.\n";
-//     return false;
-//   }
-
-//   // =========================================================================
-//   // STEP 2: Unpack DCI Parameters for PDSCH Demodulation
-//   // =========================================================================
-//   srsran::dci_format_1_0_rar dci_payload{};
-  
-//   // Unpack raw bits into DCI Format 1_0 structure using srsran/ran/pdcch/dci_packing.h
-//   bool dci_unpack_ok = srsran::unpack_dci_1_0_rar(dci_payload, raw_dci_bits);
-//   if (!dci_unpack_ok) {
-//     std::cerr << "[Step 2 Failed] Could not unpack DCI Format 1_0 RAR payload.\n";
-//     return false;
-//   }
-
-//   // Map DCI payload to PDSCH allocation grant
-//   srsran::pdsch_processor::grant_t pdsch_grant{};
-//   pdsch_grant.rnti = srsran::to_rnti(ra_rnti);
-//   pdsch_grant.freq_allocation = dci_payload.freq_alloc;
-//   pdsch_grant.time_allocation = dci_payload.time_alloc;
-//   pdsch_grant.mcs = dci_payload.mcs;
-//   pdsch_grant.rv = 0; // Standard RV 0 for initial RAR transmission
-
-//   // =========================================================================
-//   // STEP 3: Decode PDSCH to Extract Raw Transport Block Bytes
-//   // =========================================================================
-//   srsran::pdsch_processor pdsch_proc;
-//   std::vector<uint8_t> mac_tb_bytes(128); // Storage for raw MAC Transport Block
-
-//   srsran::pdsch_processor::decoding_result pdsch_result = pdsch_proc.decode(
-//       srsran::span<uint8_t>(mac_tb_bytes),
-//       srsran::span<const srsran::log_likelihood_ratio>(pdsch_llrs),
-//       pdsch_grant
-//   );
-
-//   if (!pdsch_result.tb_crc_ok) {
-//     std::cerr << "[Step 3 Failed] PDSCH LDPC decoding or Transport Block CRC failed.\n";
-//     return false;
-//   }
-
-//   mac_tb_bytes.resize(pdsch_result.tb_len_bytes);
-
-//   // =========================================================================
-//   // STEP 4: Parse MAC Subheaders & Extract Target RAR Payload
-//   // =========================================================================
-//   size_t offset = 0;
-//   while (offset < mac_tb_bytes.size()) {
-//     uint8_t header_byte = mac_tb_bytes[offset];
-//     bool extension = (header_byte & 0x80) != 0;
-//     bool type_bit  = (header_byte & 0x40) != 0; // 1 = RAPID header, 0 = BI header
-
-//     if (!type_bit) {
-//       // Backoff Indicator (BI) subheader (1 byte)
-//       offset += 1;
-//     } else {
-//       // RAPID subheader (1 byte)
-//       uint8_t rapid = header_byte & 0x3F;
-//       offset += 1;
-
-//       if (rapid == target_rapid) {
-//         // Match found -> parse 7-byte MAC RAR payload
-//         if (offset + 7 > mac_tb_bytes.size()) {
-//           std::cerr << "[Step 4 Failed] Corrupted RAR payload length.\n";
-//           return false;
-//         }
-
-//         const uint8_t* rar_ptr = &mac_tb_bytes[offset];
-
-//         // Extract 11-bit Timing Advance
-//         out_rar.timing_advance = ((uint16_t)(rar_ptr[0] & 0x7F) << 4) | ((rar_ptr[1] & 0xF0) >> 4);
-        
-//         // Extract 27-bit Uplink Grant
-//         out_rar.ul_grant = ((uint32_t)(rar_ptr[1] & 0x0F) << 23) |
-//                            ((uint32_t)(rar_ptr[2]) << 15) |
-//                            ((uint32_t)(rar_ptr[3]) << 7) |
-//                            ((uint32_t)(rar_ptr[4] & 0xFE) >> 1);
-
-//         // Extract 16-bit Temporary C-RNTI
-//         out_rar.temp_c_rnti = ((uint16_t)rar_ptr[5] << 8) | rar_ptr[6];
-//         out_rar.found = true;
-//         return true;
-//       }
-
-//       // Skip non-matching 7-byte RAR body
-//       offset += 7;
-//     }
-
-//     if (!extension) break; // End of headers
-//   }
-
-//   std::cerr << "[Step 4 Failed] RAPID " << (int)target_rapid << " not found in MAC PDU.\n";
-//   return false;
-// }
+} // namespace gone::nr

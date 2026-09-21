@@ -35,8 +35,12 @@ class Ofdm {
 public:
     Ofdm(double sample_rate, uint32_t scs_hz, uint16_t num_prbs);
 
-    // Demodulate as many complete OFDM symbols as fit in `iq`.
-    std::vector<Symbol> demodulate(const std::vector<std::complex<float>>& iq);
+    // Demodulate as many complete OFDM symbols as fit in `iq`. `iq` must start
+    // on a slot boundary; `starting_slot_in_frame` names that slot (0..19) so
+    // symbol/slot counters line up with the real gNB frame (DM-RS scrambling is
+    // slot-dependent). Default 0 keeps the buffer-local convention.
+    std::vector<Symbol> demodulate(const std::vector<std::complex<float>>& iq,
+                                   uint32_t starting_slot_in_frame = 0);
 
     // Inverse of demodulate(): turn a stream of frequency-domain Symbols back
     // into one time-domain IQ buffer (IFFT + cyclic-prefix insertion). Used by

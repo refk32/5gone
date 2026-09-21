@@ -1,5 +1,9 @@
 #pragma once
 
+#include "5gone/nr_coreset.hpp"
+#include "5gone/nr_dci.hpp"
+#include "5gone/nr_symbol.hpp"
+
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -39,6 +43,10 @@ struct RarDciObs {
     uint8_t  symbol = 0;             // OFDM symbol within slot
     uint8_t  candidate = 0;
     float    correlation = 0.0f;
+    // Sample offset (relative to the decoded `iq` buffer) where the slot that
+    // carries this RAR begins. Used by the Step-4 UL gate to map the RAR into
+    // the absolute Msg3-slot timeline. 0 when the slot start was not located.
+    uint64_t slot_start_sample = 0;
     // Decoded DCI fields (only meaningful when decoded_bits is true):
     uint32_t rb_start = 0;
     uint32_t rb_len = 0;
@@ -49,7 +57,7 @@ struct RarDciObs {
     uint8_t  rapid = 0;              // preamble the UE sent
     uint32_t timing_advance = 0;     // 12-bit TA command
     uint16_t t_c_rnti = 0;           // Temporary C-RNTI
-    std::vector<uint8_t> ul_grant;   // 20-bit RAR UL grant (bit-packed)
+    std::vector<uint8_t> ul_grant;   // 27-bit RAR UL grant (bit values, MSB first)
 };
 
 class RarDecoder {
@@ -63,7 +71,30 @@ public:
     RarDecoder& operator=(const RarDecoder&) = delete;
 
     // Demodulate + correlate `iq`, log any RAR DCI found, and return the list.
-    std::vector<RarDciObs> decode(const std::vector<std::complex<float>>& iq);
+    // `iq` must start on a slot boundary; `starting_slot_in_frame` names that
+    // slot (0..19) in the real gNB frame (DM-RS scrambling is slot-dependent).
+    // `cfo_hz` (>0) removes a residual carrier offset before demodulating.
+    std::vector<RarDciObs> decode(const std::vector<std::complex<float>>& iq,
+                                  uint32_t starting_slot_in_frame = 0,
+                                  double cfo_hz = 0.0);
+
+    // --- CORESET-config probe support (5gone-decode --coreset-sweep) ---
+    // The decoder defaults to a full-BWP, duration-1, non-interleaved CORESET
+    // anchored at PRB 0. A real gNB's CORESET #0 (from pdcchConfigSIB1) may
+    // start at a different PRB / duration / interleaver shift, which makes the
+    // default systematically blind. set_coreset() re-arms the decoder for
+    // another configuration so the sweep can search the whole grid.
+    void set_coreset(const Coreset& coreset);
+
+    // Expose the OFDM stage so a sweep demodulates the window ONCE and then
+    // re-scans it under many CORESET configs (slot labels are patched in place).
+    std::vector<Symbol> demodulate(const std::vector<std::complex<float>>& iq,
+                                   uint32_t starting_slot_in_frame);
+
+    // Correlation-only scan: every candidate above a 0 floor is returned with
+    // its DM-RS correlation score (no polar/CRC). Cheap enough to call per
+    // (config, slot-offset) in a sweep; restores prior thresholds/decode state.
+    std::vector<Dci> scan_pdcch(std::vector<Symbol>& symbols);
 
 private:
     double sample_rate_;

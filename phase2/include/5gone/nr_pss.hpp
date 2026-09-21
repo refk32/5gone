@@ -40,9 +40,15 @@ void place_sss_in_symbol(std::vector<std::complex<float>>& symbol,
 // Time-domain body (length fft_size) of one PSS symbol, generated through our
 // own Ofdm (NULL -> pure-Frequency-Domain reference is just the IFFT). Used to
 // correlate the raw IQ stream for timing.
+// Optional `bin_shift` moves the PSS spectrum so its center sits at that SCS
+// bin relative to the carrier (0 == the identity k_ssb=0 default, PSS centered
+// at +119 bins; the lab gNB's SSB is at -67). This is the same offset rx_probe
+// reports as `pss_bin_shift`, so a probe sweep result can be dropped straight
+// into find_ssb.
 std::vector<std::complex<float>> pss_time_reference(uint16_t n_id2, uint32_t fft_size,
                                                     double sample_rate = 23.04e6,
-                                                    uint32_t scs_hz = 30000);
+                                                    uint32_t scs_hz = 30000,
+                                                    int bin_shift = 0);
 
 // Normalized frequency-domain correlation of one demodulated symbol's active
 // subcarriers against PSS (resp. SSS) at subcarriers kPssFirstSub+off.. Search

@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_prach.dir/tests/test_prach.cpp.o CMakeFiles/test_prach.dir/src/nr_prach.cpp.o -o test_prach  -lm 

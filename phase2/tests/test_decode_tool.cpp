@@ -1,5 +1,6 @@
 #include "5gone/nr_rar_decoder.hpp"
 #include "5gone/nr_capture.hpp"
+#include "5gone/nr_constants.hpp"
 #include "tools/decode_capture.hpp"
 
 #include <cstdio>
@@ -15,6 +16,12 @@ static int g_fail = 0;
 
 int main()
 {
+    // Regression guard: the blind RA-RNTI window must cover the lab cell's
+    // real value (1+0+14*19 = 267 = 0x10b). A 1..71 window once made polar CRC
+    // unpassable for the whole campaign while correlation looked healthy.
+    CHECK(gone::nr::ra_rnti_min <= 267 && gone::nr::ra_rnti_max >= 267,
+          "RA-RNTI window covers the lab cell 0x10b");
+
     const std::string tmp = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp");
     const std::string pth = tmp + "/5gone_decode_test.cf32";
 
@@ -39,7 +46,7 @@ int main()
     });
     printf("[pass1] ok=%d samples=%zu slots=2\n", d1.ok, d1.decoded_samples);
     CHECK(d1.ok, "override captures decode");
-    CHECK(d1.decoded_samples == 2 * 11514u, "2-slot window decoded");
+    CHECK(d1.decoded_samples == 2 * 11520u, "2-slot window decoded");
 
     // PASS 2 — cell_sync ON with a real SSB slot mid-buffer.
     auto cap2 = nr::synth_capture(0, 0);            // pure noise preamble

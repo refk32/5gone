@@ -24,10 +24,14 @@ std::complex<float> ref_payload(uint16_t sc, uint16_t sym, float amp)
   return amp * std::complex<float>(std::cos(ph), std::sin(ph));
 }
 
-} // namespace
-
-RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
-                         float payload_amp)
+// Shared body: fills the 14-symbol slot grid exactly like build_rar_slot, with
+// the PDCCH DM-RS placed per `pdcch` (whose CORESET the caller configured).
+// slot_index selects the DM-RS scrambling slot (default 0 preserves the old
+// single-slot behaviour; tests synthesizing multi-slot captures pass the
+// slot each burst will be scanned at).
+RarSlotTx build_rar_slot_with_pdcch(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
+                                     float payload_amp, Pdcch& pdcch,
+                                     uint8_t slot_index = 0)
 {
   const uint8_t n_id2 = static_cast<uint8_t>(pci % 3);
   const uint8_t n_id1 = static_cast<uint8_t>(pci / 3);
@@ -40,33 +44,35 @@ RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
     s.samples.assign(nsc, std::complex<float>(0.0f, 0.0f));
   }
 
-  // Symbol 0: RAR PDCCH DM-RS (AL 8, candidate 0, our own detector's reference)
-  //           + QPSK "PDCCH data" everywhere else.
+  // Symbol 0..duration-1: RAR PDCCH DM-RS (AL 8 == coreset candidates[3],
+  // candidate 0) + QPSK "PDCCH data" everywhere else on those symbols, at the
+  // DM-RS locations the configured CORESET dictates. Supports CORESET durations
+  // 1..3 (each OFDM symbol of the CORESET carries its own DM-RS slice).
   {
-    Pdcch pdcch;
-    Coreset cs;
-    cs.frequency_domain_resources = bwp_prbs;
-    cs.duration = 1;
-    cs.cell_id = pci;
-    cs.starting_ofdm_symbol_within_slot = 0;
-    cs.num_symbols_per_slot = 14;
-    cs.num_slots_per_frame = 20;
-    cs.candidates_search_space = {1, 2, 4, 8, 16};
-    pdcch.set_coreset_info(cs);
-    pdcch.scrambling_id_start = pci;
-    pdcch.scrambling_id_end = pci;
-
-    constexpr uint8_t AL = 8, cand = 0, num_cands = 8, slot_index = 0;
+    constexpr uint16_t AL = 8;
+    const uint8_t num_cands = (pdcch.coreset_info.candidates_search_space.size() > 3)
+                                  ? pdcch.coreset_info.candidates_search_space[3] : 8;
+    constexpr uint8_t cand = 0;
+    const uint8_t dur = pdcch.coreset_info.duration ? pdcch.coreset_info.duration : 1;
+    const uint8_t sym0 = pdcch.coreset_info.starting_ofdm_symbol_within_slot;
     auto sc = pdcch.get_dmrs_sc_indices(AL, cand, num_cands, slot_index, false);
     auto seq = pdcch.get_dmrs_symbols(AL, cand, num_cands, slot_index, 0);
-    const size_t ndmrs = sc.size() < seq.size() ? sc.size() : seq.size();
+    const size_t ndmrs = sc.size();
+    const size_t per_sym = dur ? seq.size() / dur : 0;
 
-    std::vector<bool> is_dmrs(nsc, false);
-    for (size_t i = 0; i < ndmrs; ++i) {
-      if (sc[i] < nsc) { slot[0].samples[sc[i]] = seq[i]; is_dmrs[sc[i]] = true; }
+    for (uint8_t di = 0; di < dur; ++di) {
+      const size_t si = sym0 + di;
+      if (si >= slot.size() || per_sym == 0) break;
+      Symbol& out = slot[si];
+      std::vector<bool> is_dmrs(nsc, false);
+      const size_t n = (ndmrs < per_sym) ? ndmrs : per_sym;
+      for (size_t i = 0; i < n; ++i) {
+        const size_t idx = sc[i];
+        if (idx < nsc) { out.samples[idx] = seq[static_cast<size_t>(di) * per_sym + i]; is_dmrs[idx] = true; }
+      }
+      for (uint16_t k = 0; k < nsc; ++k)
+        if (!is_dmrs[k]) out.samples[k] = ref_payload(k, static_cast<uint16_t>(si), payload_amp);
     }
-    for (uint16_t k = 0; k < nsc; ++k)
-      if (!is_dmrs[k]) slot[0].samples[k] = ref_payload(k, 0, payload_amp);
   }
 
   // Symbol 1: guard (empty).
@@ -108,6 +114,38 @@ RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
     throw std::runtime_error("build_rar_slot: grid must have 14 symbols");
 
   return tx;
+}
+
+} // namespace
+
+RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
+                         float payload_amp)
+{
+  Pdcch pdcch;
+  Coreset cs;
+  cs.frequency_domain_resources = bwp_prbs;
+  cs.duration = 1;
+  cs.cell_id = pci;
+  cs.starting_ofdm_symbol_within_slot = 0;
+  cs.num_symbols_per_slot = 14;
+  cs.num_slots_per_frame = 20;
+  cs.candidates_search_space = {1, 2, 4, 8, 16};
+  pdcch.set_coreset_info(cs);
+  pdcch.scrambling_id_start = pci;
+  pdcch.scrambling_id_end = pci;
+  return build_rar_slot_with_pdcch(ofdm, pci, bwp_prbs, payload_amp, pdcch);
+}
+
+RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
+                         float payload_amp, const Coreset& cs,
+                         uint8_t slot_index)
+{
+  Pdcch pdcch;
+  pdcch.set_coreset_info(cs);
+  pdcch.scrambling_id_start = pci;
+  pdcch.scrambling_id_end = pci;
+  return build_rar_slot_with_pdcch(ofdm, pci, bwp_prbs, payload_amp, pdcch,
+                                   slot_index);
 }
 
 } // namespace gone::nr

@@ -105,7 +105,7 @@ int main()
     const double srate = 23.04e6;
     const double useful = 2048.0 * kK / 2.0;            // mu = 1
     const double cp_norm = 144.0 * kK / 2.0;
-    const double cp_long = (144.0 * kK + 16.0 * kK) / 2.0;
+    const double cp_long = 144.0 * kK / 2.0 + 16.0 * kK;   // 16*K NOT divided by 2^mu
     auto sym_len = [&](unsigned l) {
         double cp = (l == 0 || l == 14) ? cp_long : cp_norm;
         return static_cast<size_t>(std::floor((cp + useful) * kTc * srate));
@@ -129,6 +129,50 @@ int main()
     mean_off_peak /= cnt;
     printf("[pss-td] peak/mean-ratio=%.1f\n", pm / (mean_off_peak + 1e-9f));
     CHECK(pm > 8.0f * mean_off_peak + 1e-6f, "PSS timing peak well above background");
+
+    // ---- 4) rx_probe SSB-alignment shift (regression for the -186/-305 bug) ----
+    // The gNB radiates its SSB at SSB-center offset -186 bins from the carrier
+    // (ssb_arfcn 632256 = 3483.84 MHz, carrier 3489.42). Our unshifted PSS
+    // reference centers at kPssFirstSub+63 = +119 bins from DC. To correlate,
+    // rx_probe must shift the ref by ssb_off - ref_center = -305 bins, NOT -186.
+    // Verify: correlation peaks ONLY when ref shift == rx shift.
+    auto shift_spectrum = [](const std::vector<std::complex<float>>& v, int s) {
+        const int N = (int)v.size();
+        std::vector<std::complex<float>> out(v.size());
+        for (int k = 0; k < N; ++k) {
+            const double ph = 2.0 * 3.14159265358979323846 * s * k / N;
+            out[k] = v[k] * std::exp(std::complex<float>(0.0f, (float)ph));
+        }
+        return out;
+    };
+
+    const int ssb_off_bins = -186;                       // from gNB banner math
+    const int ref_center_bins = (int)kPssFirstSub + (int)kPssLen / 2;  // 119
+    const int pss_bin_shift_arg = ssb_off_bins;          // what user passes
+    const int need_shift = pss_bin_shift_arg - ref_center_bins;        // -305
+
+    // Received IQ from the real gNB: demodulated on our grid its PSS centers at
+    // -186 bins, i.e. shift the unshifted ref (center +119) by -305.
+    std::vector<std::complex<float>> rx_on_air = shift_spectrum(ref, need_shift);
+    auto ref_old = shift_spectrum(ref, ssb_off_bins);              // old (wrong) -186
+    auto ref_new = shift_spectrum(ref, need_shift);                // corrected  -305
+    auto tcorr_old = pss_sliding_corr(rx_on_air, ref_old);
+    auto tcorr_new = pss_sliding_corr(rx_on_air, ref_new);
+    auto tcorr_none = pss_sliding_corr(rx_on_air, ref);
+    float m_old = 0, m_new = 0, m_none = 0;
+    for (auto& v : tcorr_old) m_old = std::max(m_old, std::abs(v));
+    for (auto& v : tcorr_new) m_new = std::max(m_new, std::abs(v));
+    for (auto& v : tcorr_none) m_none = std::max(m_none, std::abs(v));
+    printf("[rw] ref_center=%d ssb_off=%d need_shift=%d\n", ref_center_bins,
+           ssb_off_bins, need_shift);
+    printf("[rw] corr(old -186)=%.3f corr(new -305)=%.3f corr(no shift)=%.3f\n",
+           m_old, m_new, m_none);
+    // pss_sliding_corr is unnormalized; the self-energy of one PSS body is
+    // kPssLen / fft = 127/768 per Parseval. A correct alignment reaches that.
+    const float full_energy = (float)kPssLen / (float)ref.size();
+    CHECK(need_shift == -305, "rx_probe shift = ssb_off - ref_center = -305");
+    CHECK(m_new >= 0.9f * full_energy, "corrected ref shift aligns with on-air SSB");
+    CHECK(m_old < 0.15f * full_energy, "old -186 shift does NOT correlate (the bug)");
 
     printf("done: %d failure(s)\n", g_fail);
     return g_fail ? 1 : 0;

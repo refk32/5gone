@@ -29,6 +29,9 @@ set(5GONE_SOURCES
   src/radio_uhd.cpp
   src/tdd_gate.cpp
   src/cell_sync.cpp
+  src/sample_clock.cpp
+  src/ul_gate.cpp
+  src/nr_prach.cpp
   src/rar_monitor.cpp
   src/attack_engine.cpp
   src/main.cpp
@@ -105,6 +108,28 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
 endif()
 target_link_libraries(test_cell_sync PRIVATE m)
 
+# --- UL-gate test (Step 4) ---
+# Pure math, no UHD: locks CellSync on a synthetic SSB slot, then checks that a
+# RAR at a known absolute slot maps to the correct Msg3 UL slot window, rejects
+# DL-scheduled and pre-lock windows, and nails the advance-subtracted TX time.
+set(ULGATE_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_ul_gate.cpp"
+  "${CMAKE_SOURCE_DIR}/src/cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/tdd_gate.cpp"
+  "${CMAKE_SOURCE_DIR}/src/sample_clock.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ul_gate.cpp"
+)
+add_executable(test_ul_gate ${ULGATE_TEST_SRC})
+target_include_directories(test_ul_gate PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_ul_gate PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_ul_gate PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_ul_gate PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_ul_gate PRIVATE m)
+
 # --- Loopback latency harness test (Step 4) ---
 # Self-contained: no UHD, no srsRAN. Injects the marker burst into a synthetic
 # RX buffer at a known offset, then checks measure_latency() recovers exactly
@@ -153,6 +178,97 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
   target_link_libraries(test_collide PRIVATE ${LIQUID_LIBRARY})
 endif()
 target_link_libraries(test_collide PRIVATE m)
+
+# --- CORESET config-sweep test (R1 blind-spot proof) ---
+# Self-contained: no UHD, no srsRAN. Synthesizes a RAR slot whose PDCCH DM-RS
+# uses a real gNB-like CORESET (48 PRB @ PRB 2, interleaved, shift=PCI%3),
+# proves the default full-BWP CORESET misses it, and that the (config x
+# slot-offset) sweep the tool runs recovers it (corr ~1.0). Exercises the
+# start_prb offset, interleaved mapping and duration>1 slicing additions.
+set(CORESET_SWEEP_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_coreset_sweep.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_tx.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+)
+add_executable(test_coreset_sweep ${CORESET_SWEEP_TEST_SRC})
+target_include_directories(test_coreset_sweep PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_coreset_sweep PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_coreset_sweep PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_coreset_sweep PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_coreset_sweep PRIVATE m)
+
+# --- Slot-aware window scan test (portable, no UHD/srsRAN) ---
+# P2-1: RarMonitor::scan_window slices stream buffers at slot boundaries
+# (explicit abs/frame clock), scans the empirical CORESET mini-grid, and
+# tracks SIB periodicity buckets. Synthetic dur-2 RAR at abs slots {2,42,9}.
+set(SLOT_SCAN_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_slot_scan.cpp"
+  "${CMAKE_SOURCE_DIR}/src/rar_monitor.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_tx.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp"
+)
+add_executable(test_slot_scan ${SLOT_SCAN_TEST_SRC})
+target_include_directories(test_slot_scan PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_slot_scan PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_slot_scan PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_slot_scan PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_slot_scan PRIVATE m)
+
+# --- RAR UL grant decoder unit test (portable, no UHD/srsRAN) ---
+# Pure TS 38.213 Tab 8.2-1 RAR-grant bit decoding (live-mode Step 1). Links
+# only mac_rar.cpp + nr_dci.cpp (riv_decode), so it builds on the Mac workspace
+# too — on the Latte it additionally documents parity with the srsRAN-4G MAC
+# RAR extraction (parse_mac_rar feeds the same 27-bit array).
+add_executable(test_rar_grant
+  "${CMAKE_SOURCE_DIR}/tests/test_rar_grant.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp")
+target_include_directories(test_rar_grant PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(test_rar_grant PRIVATE m)
+
+# --- PRACH (Msg1) generator unit test (portable, no UHD/srsRAN) ---
+# Step 5: B4 short-preamble (139/30k) ZC synthesis, Ncs table, burst geometry, occasion
+# math, frequency placement and projection back onto the PRACH subcarriers.
+set(PRACH_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_prach.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_prach.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp")
+add_executable(test_prach ${PRACH_TEST_SRC})
+target_include_directories(test_prach PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(test_prach PRIVATE m)
+
+# --- Rx sample-clock unit test (portable, no UHD) ---
+# Live-mode Step 2: UHD time-stamp -> global receive-sample index conversion
+# (sample_clock.cpp). Pure math, builds on Mac and Latte.
+add_executable(test_sample_clock
+  "${CMAKE_SOURCE_DIR}/tests/test_sample_clock.cpp"
+  "${CMAKE_SOURCE_DIR}/src/sample_clock.cpp")
+target_include_directories(test_sample_clock PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(test_sample_clock PRIVATE m)
 
 # --- Old srsRAN 4G (srsRANRF) for the full PDCCH polar/CRC decode path ---
 # Gated behind GONE_HAVE_SRSRAN_OLD. When the old srsRAN_4G C API is available
@@ -277,6 +393,7 @@ if(5GONE_ENABLE_SRSRAN_OLD)
       "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
       "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
       "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+      "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
     )
     add_executable(test_rar_pdsch ${SRSRAN4G_PDSCH_TEST_SRC})
     target_compile_definitions(test_rar_pdsch PRIVATE GONE_HAVE_SRSRAN_OLD=1)
@@ -301,6 +418,56 @@ if(5GONE_ENABLE_SRSRAN_OLD)
       target_link_libraries(test_rar_pdsch PRIVATE ${SRSRAN4G_MBEDTLS})
     endif()
     target_link_libraries(test_rar_pdsch PRIVATE m pthread)
+
+    # ---- PDCCH polar round-trip test ----
+    # test_pdcch_rt.cpp encodes random DCI payloads with srsRAN's own PDCCH TX
+    # (reference implementation), lays the symbols onto OUR candidate RE layout
+    # (+ OUR DMRS, perfect channel), and runs OUR full Pdcch::process()
+    # (DMRS channel est + LLRs + polar + CRC + RA-RNTI search). Proves the
+    # decode glue correct on clean data — the path no test has ever exercised.
+    # AL1 must survive with crc_ok (regression: the keep-gate once dropped all
+    # AL-1 successes); AL2 is the control; noise must never CRC-pass.
+    #
+    # TEMPORARILY DISABLED (2026-09-17): the srsRAN tree linked on Latte
+    # provides init_rx but not init_tx/set_carrier/encode (RX-only build?),
+    # so the srsRAN-TX-based harness cannot link there yet. Options: (a) hand
+    # roll TX from linked primitives (polar_encoder/rm_tx/mod tables — verify
+    # presence first), or (b) compile the missing srsran TX object as an
+    # explicit source like polar_chanalloc.c below. Re-enable after the
+    # re-decode results below decide whether glue-doubt remains.
+    # set(PDCCH_RT_TEST_SRC
+    #   "${CMAKE_SOURCE_DIR}/tests/test_pdcch_rt.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+    #   "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+    # )
+    # add_executable(test_pdcch_rt ${PDCCH_RT_TEST_SRC})
+    # target_compile_definitions(test_pdcch_rt PRIVATE GONE_HAVE_SRSRAN_OLD=1)
+    # target_include_directories(test_pdcch_rt PRIVATE
+    #   "${CMAKE_SOURCE_DIR}/include"
+    #   ${SRSRAN4G_INCLUDE_DIR})
+    # foreach(dir ${SRSRAN4G_LINK_DIRS})
+    #   target_link_directories(test_pdcch_rt PRIVATE "${dir}")
+    # endforeach()
+    # if(EXISTS "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_chanalloc.c")
+    #   target_sources(test_pdcch_rt PRIVATE
+    #     "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_chanalloc.c"
+    #     "${SRSRAN4G_SRC}/lib/src/phy/fec/polar/polar_interleaver.c")
+    # endif()
+    # # Archives first, then their DSO deps (see --as-needed note above).
+    # target_link_libraries(test_pdcch_rt PRIVATE
+    #   -Wl,--start-group srsran_common srsran_phy srsran_mac srslog support srsran_asn1 asn1_utils -Wl,--end-group)
+    # if(SRSRAN4G_FFTW)
+    #   target_link_libraries(test_pdcch_rt PRIVATE ${SRSRAN4G_FFTW})
+    # endif()
+    # if(SRSRAN4G_MBEDTLS)
+    #   target_link_libraries(test_pdcch_rt PRIVATE ${SRSRAN4G_MBEDTLS})
+    # endif()
+    # target_link_libraries(test_pdcch_rt PRIVATE m pthread)
   else()
     message(STATUS "5Gone: srsRAN 4G not found — correlation-only PDCCH decode (run scripts/install-srsran-4g.sh)")
   endif()

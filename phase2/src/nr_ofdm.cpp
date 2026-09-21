@@ -25,11 +25,15 @@ Ofdm::Ofdm(double sample_rate, uint32_t scs_hz, uint16_t num_prbs)
 
     // Cyclic prefix lengths (TS 38.211 5.3.1). For mu=1, 30 kHz:
     //   normal CP symbol   = 144*K/2^mu  time units
-    //   long CP (symbol 0) = (144*K + 16*K)/2^mu  (only on symbols 0 and 7*2^mu)
+    //   long CP (symbol 0) = 144*K/2^mu + 16*K  (only on symbols 0 and 7*2^mu)
+    // NOTE the 16*K term is NOT divided by 2^mu (spec formula); dividing it
+    // (as an earlier revision did) loses 6 samples/slot at 23.04 MHz/30 kHz
+    // (11514 vs the true 11520), which walks every slot grid 0.26 us/slot and
+    // silently misplaces TX occasions and demod slicing far from the lock.
     const uint32_t two_mu = 1u << numerology;
     const double useful_length = 2048.0 * kK / static_cast<double>(two_mu);
     const double normal_cp = 144.0 * kK / static_cast<double>(two_mu);
-    const double normal_cp_long = (144.0 * kK + 16.0 * kK) / static_cast<double>(two_mu);
+    const double normal_cp_long = 144.0 * kK / static_cast<double>(two_mu) + 16.0 * kK;
 
     const uint32_t syms_per_subframe = slots_per_subframe * symbols_per_slot; // 28
     samples_per_cp_.resize(syms_per_subframe);
@@ -124,13 +128,16 @@ std::vector<std::complex<float>> Ofdm::ifft(const std::vector<std::complex<float
 #endif
 }
 
-std::vector<Symbol> Ofdm::demodulate(const std::vector<std::complex<float>>& iq)
+std::vector<Symbol> Ofdm::demodulate(const std::vector<std::complex<float>>& iq,
+                                     uint32_t starting_slot_in_frame)
 {
     std::vector<Symbol> out;
 
     // Bookkeeping: which symbol/slot each demodulated OFDM symbol belongs to.
-    uint32_t symbol_in_subframe = 0;  // absolute within 1 ms subframe (0..27)
-    uint32_t slot_in_frame = 0;       // slot within the 10 ms frame (0..19)
+    // `iq` must start on a slot boundary; callers that slice a real gNB slot
+    // boundary pass the absolute slot number so DM-RS scrambling lines up.
+    uint32_t slot_in_frame = starting_slot_in_frame % slots_per_frame_;
+    uint32_t symbol_in_subframe = (slot_in_frame % slots_per_subframe) * symbols_per_slot_;
     uint32_t symbol_in_slot = 0;      // symbol within the slot (0..13)
 
     std::size_t pos = 0;
@@ -159,6 +166,7 @@ std::vector<Symbol> Ofdm::demodulate(const std::vector<std::complex<float>>& iq)
         }
 
         // Timestamp the symbol for the decoder.
+        s.sample_index = pos;   // sample offset of this symbol within `iq`
         s.symbol_index = static_cast<uint8_t>(symbol_in_slot);
         s.slot_index   = static_cast<uint8_t>(slot_in_frame);
 

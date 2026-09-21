@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_sample_clock.dir/tests/test_sample_clock.cpp.o CMakeFiles/test_sample_clock.dir/src/sample_clock.cpp.o -o test_sample_clock  -lm 

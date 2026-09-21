@@ -40,28 +40,40 @@ def main():
     burst = spec.max(axis=0) / (mean_p + 1e-30)
 
     hot = np.where((burst > 3.0) & (mean_p > 3 * floor))[0]
-    hot = hot[hot < W // 2]  # positive-frequency half only
-    best_burst, best_bin = 0.0, -1
+
+    # Signed bin (b->b-W above the Nyquist edge) so bins past W//2 map to the
+    # negative-frequency half. The real SSB below the carrier (e.g. 5.58 MHz ->
+    # bin 582 -> signed -186) must NOT be filtered out.
+    def signed(b):
+        return int(b) if int(b) < W // 2 else int(b) - W
+
+    best_burst, best_bin_idx = 0.0, -1
     print("  bin   f(MHz)   burst   mean(dB rel)  span(+-3)")
     for i in range(len(hot)):
-        b = int(hot[i])
-        span = sum(1 for j in hot if -3 <= int(j) - b <= 3)
-        mdb = 10*np.log10(mean_p[b] / floor + 1e-12)
-        print(f"{b:5d}  {fc_mhz + k[b]/1e6:8.3f}  {burst[b]:5.1f}  {mdb:8.1f}  {span}")
-        if span >= 4 and burst[b] > best_burst:
-            best_burst, best_bin = burst[b], b
+        b = signed(hot[i])
+        span = sum(1 for j in hot if -3 <= signed(j) - b <= 3)
+        mdb = 10*np.log10(mean_p[int(hot[i])] / floor + 1e-12)
+        print(f"{b:5d}  {fc_mhz + k[int(hot[i])]/1e6:8.3f}  {burst[int(hot[i])]:5.1f}  {mdb:8.1f}  {span}")
+        if span >= 4 and burst[int(hot[i])] > best_burst:
+            best_burst, best_bin_idx = burst[int(hot[i])], int(hot[i])
 
-    if best_bin < 0:
+    if best_bin_idx < 0:
         print("NO bursty SSB cluster found: no periodic SSB above the noise floor.")
         print("Either the gNB is not radiating, or the RX freq/antenna is wrong.")
         return
 
-    hub = int(best_bin)
-    cluster = [j for j in hot if abs(int(j) - hub) <= 8]
-    center = int(round(np.mean(cluster)))
-    delta = center - 119
-    print(f"\nSSB burst cluster center: bin {center} -> {fc_mhz + k[center]/1e6:.3f} MHz")
-    print(f"PSS bin offset vs our ref: delta = {delta:+d} bins ({delta*0.03:+.2f} MHz)")
+    # Burst-weighted centroid of the hot cluster within one PSS half-span
+    # (~63 bins) of the peak-hot bin. More robust than trusting the single
+    # max-burst bin, which a noise spike can hijack.
+    hub = signed(best_bin_idx)
+    cl = [(signed(j), burst[int(j)]) for j in hot
+          if abs(signed(j) - hub) <= 63]
+    wsum = sum(w for _, w in cl)
+    center = int(round(sum(b * w for b, w in cl) / wsum)) if wsum > 0 else hub
+    ssb_off_bins = center           # signed bin == offset from DC == offset from carrier
+    print(f"\nSSB burst cluster center: bin {center} (signed) -> {fc_mhz + k[best_bin_idx]/1e6:.3f} MHz")
+    print(f"SSB center offset from carrier: {ssb_off_bins:+d} bins ({ssb_off_bins*0.03:+.2f} MHz)")
+    print(f"-> pass that signed bin offset as rx_probe's pss_bin_shift (e.g. -186)")
 
 if __name__ == "__main__":
     main()

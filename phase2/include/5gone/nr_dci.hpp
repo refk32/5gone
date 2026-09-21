@@ -58,6 +58,11 @@ struct DciFormat10 {
 // (n_start_prb, n_length_prb) for a BWP of n_rb_bwp PRBs.
 void riv_decode(uint32_t riv, uint32_t n_rb_bwp, uint32_t& n_start_prb, uint32_t& n_length_prb);
 
+// Encode (n_start_prb, n_length_prb) into the Type-1 RIV (exact inverse of
+// riv_decode; used to build the constant RarGrant's pusch_freq_res for the
+// Path-2 firing path). Clamps invalid allocations to 0.
+uint32_t riv_encode(uint32_t n_start_prb, uint32_t n_length_prb, uint32_t n_rb_bwp);
+
 // Number of DCI 1_0 payload bits for the given BWP size.
 uint32_t dci_format10_bits(uint32_t n_rb_bwp);
 

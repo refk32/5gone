@@ -57,4 +57,14 @@ struct RarSlotTx {
 RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
                          float payload_amp = 0.5f);
 
+// Same, but place the PDCCH DM-RS per an explicit CORESET (offset PRB, duration,
+// interleaver shift/mapping). Used by tests to synthesize the RX side under a
+// real gNB-like CORESET #0 and prove the default assumptions miss it.
+// slot_index selects the DM-RS scrambling slot so multi-slot captures can be
+// synthesized with each burst scrambled for the slot it will be scanned at.
+class Coreset;
+RarSlotTx build_rar_slot(Ofdm& ofdm, uint16_t pci, uint16_t bwp_prbs,
+                         float payload_amp, const Coreset& coreset,
+                         uint8_t slot_index = 0);
+
 } // namespace gone::nr

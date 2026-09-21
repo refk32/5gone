@@ -114,7 +114,14 @@ static constexpr double K  = 64.0;                      // scaling constant
 //   f_id : frequency index (0..7)
 //
 // For a small cell the value stays well below 71, so we blind-search 1..71.
+// ^^^ WRONG (kept for history): t_id is the PRACH occasion's slot index and
+// reaches 79, so real cells exceed 71 routinely. Our lab cell (config 159,
+// occasion in slot 19, s_id=0, f_id=0) uses RA-RNTI = 1+0+14*19 = 267 = 0x10b
+// on EVERY occasion — the old 1..71 range never tried it, so polar CRC could
+// never pass and no DCI/PDSCH/MAC-RAR ever decoded. Search 1..512 (covers
+// t_id<=36 at f_id=0 with margin; full spec range runs to 17920 — widen
+// further only with a per-candidate cost budget, polar attempts scale it).
 static constexpr uint16_t ra_rnti_min = 1;
-static constexpr uint16_t ra_rnti_max = 71;
+static constexpr uint16_t ra_rnti_max = 512;
 
 } // namespace gone::nr

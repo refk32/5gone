@@ -2,9 +2,8 @@
 
 #include "5gone/nr_ofdm.hpp"
 
-#include <cmath>
 #include <algorithm>
-
+#include <cmath>
 
 namespace gone::nr {
 
@@ -67,7 +66,8 @@ void place_sss_in_symbol(std::vector<std::complex<float>>& symbol,
 }
 
 std::vector<std::complex<float>> pss_time_reference(uint16_t n_id2, uint32_t fft_size,
-                                                    double sample_rate, uint32_t scs_hz)
+                                                    double sample_rate, uint32_t scs_hz,
+                                                    int bin_shift)
 {
     // Build one PSS symbol (k_ssb = 0, SSB at BWP subcarriers 0..239) through
     // our own modulator; the useful body is the last fft_size samples.
@@ -80,8 +80,25 @@ std::vector<std::complex<float>> pss_time_reference(uint16_t n_id2, uint32_t fft
 
     auto iq = ofdm.modulate(one);
     if (iq.size() < fft_size) return {};
-    return std::vector<std::complex<float>>(iq.end() - static_cast<std::ptrdiff_t>(fft_size),
-                                            iq.end());
+    std::vector<std::complex<float>> body(iq.end() - static_cast<std::ptrdiff_t>(fft_size),
+                                          iq.end());
+
+    // Identity mapping centers the PSS at kPssFirstSub + kPssLen/2 = +119 bins.
+    // Shift by (bin_shift - 119) so the reference's PSS sits at `bin_shift`.
+    // NOTE: bin_shift == 0 is the SIM/loopback sentinel (the synthesized SSB is
+    // at +119), so a zero/119 shift leaves the PSS at +119; real OTA shifts are
+    // non-zero (e.g. -187 carrier-tuned, -1 SSB-tuned) and always apply the ramp.
+    {
+        const int shift_bins = (bin_shift == 0)
+            ? 0
+            : bin_shift - static_cast<int>(kPssFirstSub + kPssLen / 2);
+        for (size_t k = 0; k < body.size(); ++k) {
+            const double ph = 2.0 * 3.14159265358979323846 * shift_bins *
+                              static_cast<double>(k) / static_cast<double>(fft_size);
+            body[k] *= std::exp(std::complex<float>(0.0f, static_cast<float>(ph)));
+        }
+    }
+    return body;
 }
 
 static float correlate_fd(const std::vector<std::complex<float>>& symbol,

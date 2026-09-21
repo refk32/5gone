@@ -41,6 +41,22 @@ void riv_decode(uint32_t riv, uint32_t n_rb_bwp, uint32_t& n_start_prb, uint32_t
     n_length_prb = l + 1;                 // final length
 }
 
+uint32_t riv_encode(uint32_t n_start_prb, uint32_t n_length_prb, uint32_t n_rb_bwp)
+{
+    // TS 38.214 5.1.2.2.1 (Type-1), exact inverse of riv_decode:
+    //   if (L-1) <= floor(N/2) :  RIV = N*(L-1) + RB_start
+    //   else                   :  RIV = N*(N-L+1) + (N-1-RB_start)
+    const uint32_t N = n_rb_bwp;
+    if (N == 0 || n_length_prb == 0 || n_length_prb > N ||
+        n_start_prb > N - n_length_prb) {
+        return 0;   // invalid / unallocatable
+    }
+    const uint32_t L = n_length_prb;
+    const uint32_t R = n_start_prb;
+    if (L - 1 <= N / 2) return N * (L - 1) + R;
+    return N * (N - L + 1) + (N - 1 - R);
+}
+
 DciFormat10 DciFormat10::parse(const std::vector<uint8_t>& bits, uint32_t n_rb_bwp)
 {
     DciFormat10 d;

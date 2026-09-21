@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_pss.dir/tests/test_pss.cpp.o CMakeFiles/test_pss.dir/src/nr_pss.cpp.o CMakeFiles/test_pss.dir/src/nr_ofdm.cpp.o -o test_pss  /usr/lib/x86_64-linux-gnu/libliquid.so -lm 

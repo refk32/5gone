@@ -92,7 +92,7 @@ inline std::vector<std::complex<float>>
 synth_capture(uint16_t pci, size_t slots, float strength = 0.8f)
 {
     Ofdm tx(23.04e6, 30000, 51);
-    const size_t preamble = 900;   // proportionally ~8% of one slot (11514)
+    const size_t preamble = 900;   // proportionally ~8% of one slot (11520)
     std::vector<std::complex<float>> out = synth_noise(preamble);
     if (pci == 0) return out;
 

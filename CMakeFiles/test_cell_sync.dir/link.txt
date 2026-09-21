@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_cell_sync.dir/tests/test_cell_sync.cpp.o CMakeFiles/test_cell_sync.dir/src/cell_sync.cpp.o CMakeFiles/test_cell_sync.dir/src/nr_pss.cpp.o CMakeFiles/test_cell_sync.dir/src/nr_ofdm.cpp.o -o test_cell_sync  /usr/lib/x86_64-linux-gnu/libliquid.so -lm 

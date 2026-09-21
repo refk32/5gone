@@ -44,6 +44,9 @@ public:
   // Read back what the device actually applied (for diagnostics).
   double get_tx_gain() const;
   double get_rx_gain() const;
+  // Override TX gain after construction (used by the PRACH sender to raise the
+  // burst power without touching the shared `radio.tx_gain` default).
+  void set_tx_gain(double db);
   double get_tx_freq_hz() const;
   double get_rx_freq_hz() const;
   std::string get_tx_antenna() const;

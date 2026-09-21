@@ -1,6 +1,7 @@
 #pragma once
 
 #include "5gone/nr_coreset.hpp"
+#include "5gone/nr_constants.hpp"
 #include "5gone/nr_dci.hpp"
 #include "5gone/nr_symbol.hpp"
 
@@ -24,8 +25,9 @@ public:
   // Configuration
   uint16_t scrambling_id_start = 0;
   uint16_t scrambling_id_end = 0xffff;
-  uint16_t rnti_start = 1;    // RA-RNTI range (TS 38.321)
-  uint16_t rnti_end = 71;
+  uint16_t rnti_start = 1;    // RA-RNTI range (TS 38.321; see ra_rnti_max:
+  uint16_t rnti_end = 512;    // the lab cell uses 267 = 0x10b, ctor overwrites
+                              // both from nr_constants anyway)
   std::vector<uint8_t> dci_sizes_list;          // e.g. {39} for DCI 1_0 @ 51 RB
   std::vector<float> AL_corr_thresholds;        // per AL {1,2,4,8,16}
   int rnti_list_length = 0xffff;
@@ -35,6 +37,16 @@ public:
   Coreset coreset_info;
 
   void set_coreset_info(const Coreset& c) { coreset_info = c; }
+
+  // Correlation-only sweep helpers: floor every per-AL threshold to the same
+  // value (0 = report every candidate with its score), and force the polar/CRC
+  // decode path off (or back on). scan_pdcch() / 5gone-decode --coreset-sweep
+  // use these so a sweep never needs srsRAN-4G and never throws away a weak
+  // but real DM-RS hit just because an AL threshold was tuned for decodes.
+  void set_corr_thresholds(float t) {
+    AL_corr_thresholds.assign(NUM_ALs, t);
+  }
+  void set_decode_enabled(bool on) { decode_enabled = on; }
 
   // Precompute DMRS reference sequences/indices for all scrambling ids / ALs /
   // slots / candidates.

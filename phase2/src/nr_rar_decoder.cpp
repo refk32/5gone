@@ -35,7 +35,7 @@ RarDecoder::RarDecoder(double sample_rate, uint32_t scs_hz, uint16_t pci, uint16
     pdcch_->scrambling_id_start = pci_;
     pdcch_->scrambling_id_end   = pci_;        // only watch our cell
     pdcch_->rnti_start = ra_rnti_min;          // 1
-    pdcch_->rnti_end   = ra_rnti_max;          // 71  (RA-RNTI range)
+    pdcch_->rnti_end   = ra_rnti_max;          // 512 (lab cell: 267 = 0x10b)
     pdcch_->dci_sizes_list = { (uint8_t)dci_format10_bits(bwp_prbs_) };  // 39 @ 51 RB
 
     // With srsRAN_4G present we also recover the DCI bits; without it we rely on
@@ -65,10 +65,55 @@ RarDecoder::~RarDecoder()
     delete pdsch_;
 }
 
-std::vector<RarDciObs> RarDecoder::decode(const std::vector<std::complex<float>>& iq)
+void RarDecoder::set_coreset(const Coreset& coreset)
 {
+    // Re-arm the PDCCH stage for a different CORESET (used by the config
+    // sweep). Scrambling ids / RNTI range / DCI sizes depend on the cell + BWP,
+    // not the CORESET, so they are left untouched.
+    pdcch_->set_coreset_info(coreset);
+    pdcch_->initialize_dmrs_seq();
+}
+
+std::vector<Symbol> RarDecoder::demodulate(const std::vector<std::complex<float>>& iq,
+                                           uint32_t starting_slot_in_frame)
+{
+    return ofdm_->demodulate(iq, starting_slot_in_frame);
+}
+
+std::vector<Dci> RarDecoder::scan_pdcch(std::vector<Symbol>& symbols)
+{
+    const std::vector<float> saved_thresh = pdcch_->AL_corr_thresholds;
+    const bool saved_decode = pdcch_->decode_enabled;
+    pdcch_->AL_corr_thresholds.assign(NUM_ALs, 0.0f);  // report every candidate score
+    pdcch_->decode_enabled = false;                    // correlation-only
+    auto found = pdcch_->process(symbols, 0);
+    pdcch_->AL_corr_thresholds = saved_thresh;
+    pdcch_->decode_enabled = saved_decode;
+    return found;
+}
+
+std::vector<RarDciObs> RarDecoder::decode(const std::vector<std::complex<float>>& iq,
+                                          uint32_t starting_slot_in_frame,
+                                          double cfo_hz)
+{
+    // Step 0: optional residual-carrier-offset correction before demodulation.
+    //           s(t) = s(t) * exp(-j*2*pi*f_cfo*t)
+    std::vector<std::complex<float>> corrected = iq;
+    if (cfo_hz != 0.0) {
+        const double twopi_f = 2.0 * 8.0 * std::atan(1.0) * cfo_hz / sample_rate_;
+        const std::complex<double> step(std::cos(twopi_f), -std::sin(twopi_f));
+        std::complex<double> phasor(1.0, 0.0);
+        for (auto& s : corrected) {
+            const std::complex<float> c(s);
+            s = std::complex<float>(
+                static_cast<float>(c.real() * phasor.real() - c.imag() * phasor.imag()),
+                static_cast<float>(c.real() * phasor.imag() + c.imag() * phasor.real()));
+            phasor *= step;
+        }
+    }
+
     // Step 1: OFDM demodulate the raw IQ samples into frequency-domain Symbols.
-    auto symbols = ofdm_->demodulate(iq);
+    auto symbols = ofdm_->demodulate(corrected, starting_slot_in_frame);
 
     // Step 2: run the PDCCH blind decode (DM-RS correlation; polar decode if srsRAN).
     auto found = pdcch_->process(symbols, 0);
@@ -105,6 +150,7 @@ std::vector<RarDciObs> RarDecoder::decode(const std::vector<std::complex<float>>
                     }
                 }
                 if (sym0 >= 0) {
+                    obs.slot_start_sample = symbols[sym0].sample_index;
                     PdschTb tb = pdsch_->demodulate(symbols, (uint32_t)sym0, dci, d.rnti);
                     if (tb.valid && !tb.tb_bytes.empty()) {
                         MacRar rar = parse_mac_rar(tb.tb_bytes);
@@ -139,10 +185,21 @@ std::vector<RarDciObs> RarDecoder::decode(const std::vector<std::complex<float>>
                 std::printf("[rar-mac] PDSCH decode: No RAR subPDU (DL-SCH CRC fail or non-RAR TB)\n");
             }
         } else if (verbose_) {
-            std::printf("[rar-dl] RAR PDCCH detected by DM-RS correlation: AL=%u slot=%u sym=%u "
-                        "cand=%u corr=%.3f (decode disabled: build with srsRAN-4G for DCI bits)\n",
-                        (unsigned)obs.aggregation_level, (unsigned)obs.slot, (unsigned)obs.symbol,
-                        (unsigned)obs.candidate, obs.correlation);
+            if (pdcch_->decode_enabled) {
+                // Decode ran but no RNTI passed CRC: report the range tried so
+                // a too-narrow RA-RNTI window is diagnosable (it once silently
+                // excluded the cell's real 0x10b for the whole campaign).
+                std::printf("[rar-dl] RAR PDCCH correlation-only: AL=%u slot=%u sym=%u "
+                            "cand=%u corr=%.3f (DCI CRC failed for RA-RNTI %u..%u)\n",
+                            (unsigned)obs.aggregation_level, (unsigned)obs.slot, (unsigned)obs.symbol,
+                            (unsigned)obs.candidate, obs.correlation,
+                            (unsigned)pdcch_->rnti_start, (unsigned)pdcch_->rnti_end);
+            } else {
+                std::printf("[rar-dl] RAR PDCCH detected by DM-RS correlation: AL=%u slot=%u sym=%u "
+                            "cand=%u corr=%.3f (decode disabled: build with srsRAN-4G for DCI bits)\n",
+                            (unsigned)obs.aggregation_level, (unsigned)obs.slot, (unsigned)obs.symbol,
+                            (unsigned)obs.candidate, obs.correlation);
+            }
         }
 
         out.push_back(obs);

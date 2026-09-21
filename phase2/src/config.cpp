@@ -50,6 +50,7 @@ AttackConfig load_config(const std::string& yaml_path)
     if (c["scs_khz"]) cfg.scs_khz = c["scs_khz"].as<uint8_t>();
     if (c["bandwidth_mhz"]) cfg.bandwidth_mhz = c["bandwidth_mhz"].as<uint16_t>();
     if (c["band"]) cfg.band = c["band"].as<uint8_t>();
+    if (c["pss_bin_shift"]) cfg.pss_bin_shift = c["pss_bin_shift"].as<int>();
     if (c["dl_arfcn"]) {
       // n78 ARFCN → approx center (lab uses gNB config dl_arfcn 632628)
       uint32_t arfcn = c["dl_arfcn"].as<uint32_t>();
@@ -61,6 +62,8 @@ AttackConfig load_config(const std::string& yaml_path)
     const auto& a = root["attack"];
     cfg.symbol_advance_us = yaml_dbl(a, "symbol_advance_us", cfg.symbol_advance_us);
     cfg.tx_power_scale = yaml_dbl(a, "tx_power_scale", cfg.tx_power_scale);
+    cfg.live_fire_corr = static_cast<float>(yaml_dbl(a, "live_fire_corr", cfg.live_fire_corr));
+    if (a["tc_rnti_seed"]) cfg.live_tc_rnti_seed = a["tc_rnti_seed"].as<uint16_t>();
   }
 
   if (root["loopback"]) {
@@ -71,6 +74,35 @@ AttackConfig load_config(const std::string& yaml_path)
     cfg.loopback_tx_scale = yaml_dbl(lb, "tx_scale", cfg.loopback_tx_scale);
     cfg.loopback_dump_path = yaml_str(lb, "dump_path", cfg.loopback_dump_path);
     cfg.loopback_probe = yaml_bool(lb, "probe", cfg.loopback_probe);
+  }
+
+  if (root["prach"]) {
+    const auto& p = root["prach"];
+    cfg.prach.enabled = yaml_bool(p, "enabled", cfg.prach.enabled);
+    if (p["rapid"]) cfg.prach.rapid = p["rapid"].as<uint16_t>();
+    cfg.prach.cycle_rapids = yaml_bool(p, "cycle_rapids", cfg.prach.cycle_rapids);
+    if (p["root_sequence_index"]) cfg.prach.root_sequence_index = p["root_sequence_index"].as<uint16_t>();
+    if (p["zero_correlation_zone"]) cfg.prach.zero_correlation_zone = p["zero_correlation_zone"].as<uint8_t>();
+    if (p["msg1_frequency_start_prb"]) cfg.prach.msg1_frequency_start_prb = p["msg1_frequency_start_prb"].as<uint16_t>();
+    if (p["occasion_slot"]) cfg.prach.occasion_slot = p["occasion_slot"].as<uint8_t>();
+    if (p["occasion_count"]) cfg.prach.occasion_count = p["occasion_count"].as<uint32_t>();
+    cfg.prach.sweep_occasion_slots = yaml_bool(p, "sweep_occasion_slots", cfg.prach.sweep_occasion_slots);
+    cfg.prach.auto_cfo = yaml_bool(p, "auto_cfo", cfg.prach.auto_cfo);
+    cfg.prach.cfo_comp_hz = yaml_dbl(p, "cfo_comp_hz", cfg.prach.cfo_comp_hz);
+    cfg.prach.dither_cfo = yaml_bool(p, "dither_cfo", cfg.prach.dither_cfo);
+    cfg.prach.dither_halfspan_hz = yaml_dbl(p, "dither_halfspan_hz", cfg.prach.dither_halfspan_hz);
+    cfg.prach.dither_step_hz = yaml_dbl(p, "dither_step_hz", cfg.prach.dither_step_hz);
+    cfg.prach.tx_gain_db = yaml_dbl(p, "tx_gain_db", cfg.prach.tx_gain_db);
+    cfg.prach.rar_capture_dir = p["rar_capture_dir"] ? p["rar_capture_dir"].as<std::string>() : std::string();
+    if (p["rar_capture_window_slots"])
+      cfg.prach.rar_capture_window_slots = p["rar_capture_window_slots"].as<uint32_t>();
+    if (p["rar_capture_pre_slots"])
+      cfg.prach.rar_capture_pre_slots = p["rar_capture_pre_slots"].as<uint32_t>();
+    cfg.prach.rar_capture_drain_sec = yaml_dbl(p, "rar_capture_drain_sec", cfg.prach.rar_capture_drain_sec);
+    cfg.prach.live_scan = yaml_bool(p, "live_scan", cfg.prach.live_scan);
+  } else {
+    // No `prach:` node: default-off, so zero-change for existing configs.
+    cfg.prach.enabled = false;
   }
 
   if (root["collide"]) {
@@ -122,6 +154,20 @@ AttackConfig load_config_with_overrides(const std::string& yaml_path, int argc, 
       cfg.rx_subdev = argv[++i];
     } else if (std::strcmp(argv[i], "--loop-iterations") == 0 && i + 1 < argc) {
       cfg.loopback_iterations = static_cast<uint32_t>(std::stoul(argv[++i]));
+    } else if (std::strcmp(argv[i], "--occasion-slot") == 0 && i + 1 < argc) {
+      cfg.prach.occasion_slot = static_cast<uint8_t>(std::stoul(argv[++i]));
+    } else if (std::strcmp(argv[i], "--occasion-count") == 0 && i + 1 < argc) {
+      cfg.prach.occasion_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+    } else if (std::strcmp(argv[i], "--sweep-occasion-slots") == 0) {
+      cfg.prach.sweep_occasion_slots = true;
+    } else if (std::strcmp(argv[i], "--cfo") == 0 && i + 1 < argc) {
+      cfg.prach.cfo_comp_hz = std::stod(argv[++i]);
+    } else if (std::strcmp(argv[i], "--dither-cfo") == 0) {
+      cfg.prach.dither_cfo = true;
+    } else if (std::strcmp(argv[i], "--no-live-scan") == 0) {
+      cfg.prach.live_scan = false;
+    } else if (std::strcmp(argv[i], "--no-dither-cfo") == 0) {
+      cfg.prach.dither_cfo = false;
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       std::cout << "5gone-rar-dos — RAR DoS uplink overshadow (Section 4.1)\n"
                 << "  --mode sim|inject|live|bus|loopback|collide\n"
@@ -132,6 +178,12 @@ AttackConfig load_config_with_overrides(const std::string& yaml_path, int argc, 
                 << "  --tx-subdev SPEC  (loopback; default A:A)\n"
                 << "  --rx-subdev SPEC  (loopback; default A:B)\n"
                 << "  --loop-iterations N\n"
+                << "  --occasion-slot N     PRACH occasion slot-in-frame (0..19)\n"
+                << "  --occasion-count N    occasions to send on\n"
+                << "  --sweep-occasion-slots  cycle slot 0..19 across sends (one lock)\n"
+                << "  --cfo HZ              TX CFO compensation (comb offset)\n"
+                << "  --dither-cfo | --no-dither-cfo\n"
+                << "  --no-live-scan      skip live RAR monitor (pure capture runs)\n"
                 << "  --dry-run\n";
       std::exit(0);
     }

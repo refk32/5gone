@@ -6,12 +6,12 @@ removes the per-window DC offset (kills the B210 DC-leakage tone that used to
 mask everything), and prints, per 5 ms block, the absolute noise floor and the
 energy in two candidate PSS bands:
   A) around the DL carrier        (~3489.4 MHz)  -> SSB at cell center
-  B) ~7.5 MHz below the carrier   (~3481.9 MHz)  -> SSB near band edge
-     (srsRAN ssb_arfcn 632256 maps exactly there)
+  B) at the gNB's real SSB offset (default -5.58 MHz => band -4.6..-6.5 MHz)
+     (srsRAN ssb_arfcn 632256 = 3483.84 MHz = carrier - 5.58 MHz, NOT -7.5)
 Values are dBFS (full-scale sine = 0 dBFS); B210 noise floor ~ -80..-100 dBFS.
 A CW/PSS window ON shows A (or B) jumping 20-40 dB above floor for its 0.4 s.
 
-usage: python3 rx_probe_psd.py <file.cf32> [srate=23.04e6] [fc_mhz=3489.42] [stride=5]
+usage: python3 rx_probe_psd.py <file.cf32> [srate=23.04e6] [fc_mhz=3489.42] [stride=5] [ssb_off_mhz=-5.58]
 """
 import sys
 import numpy as np
@@ -21,6 +21,7 @@ def main():
     srate = float(sys.argv[2]) if len(sys.argv) > 2 else 23.04e6
     fc_mhz = float(sys.argv[3]) if len(sys.argv) > 3 else 3489.42
     stride = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+    ssb_off_mhz = float(sys.argv[5]) if len(sys.argv) > 5 else -5.58
 
     W = 768
     iq = np.fromfile(path, dtype=np.complex64)
@@ -35,10 +36,10 @@ def main():
     fbin = fc_mhz + k / 1e6
     neg = k < 0
     A = np.abs(k/1e6) <= 1.0
-    B = (k/1e6 >= -8.5) & (k/1e6 <= -6.5)
+    B = (k/1e6 >= ssb_off_mhz - 0.9) & (k/1e6 <= ssb_off_mhz + 0.9)
 
     blocks = x.shape[0] // 150
-    print("  t_ms  floor(dBFS)  f_peak(MHz)  p_dBFS   A@+0   B@-7.5  (dBFS, max in +/-1 MHz)")
+    print(f"  t_ms  floor(dBFS)  f_peak(MHz)  p_dBFS   A@+0   B@{ssb_off_mhz:.2f}  (dBFS, max in band)")
     for b in range(0, blocks, stride):
         blk = x[b*150:(b+1)*150]
         X = np.fft.fft(blk * win, axis=1)

@@ -31,8 +31,12 @@ namespace gone::nr {
 struct Coreset {
     uint8_t  control_resourceset_id = 1;
     // Which PRBs the CORESET spans (bitmap -> PRBs). For a full-BWP CORESET
-    // this is `(1 << bwp_num_prbs) - 1`.
+    // this is `(1 << bwp_num_prbs) - 1`. (Treated here as the PRB COUNT.)
     uint16_t frequency_domain_resources = 0;
+    // Starting PRB of the CORESET within the BWP. A real CORESET #0 (from
+    // pdcchConfigSIB1) is rarely anchored at PRB 0, so the DM-RS/data SC index
+    // math adds this offset. Default 0 = original full-BWP behaviour.
+    uint16_t start_prb = 0;
     uint8_t  duration = 1;            // OFDM symbols (1..3)
     std::string cce_reg_mapping_type = "non-interleaved";
     uint8_t  reg_bundlesize = 6;

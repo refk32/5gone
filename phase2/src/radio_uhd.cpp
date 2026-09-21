@@ -173,6 +173,11 @@ double RadioUhd::get_tx_gain() const
   try { return impl_->usrp->get_tx_gain(); } catch (...) { return -1.0; }
 }
 
+void RadioUhd::set_tx_gain(double db)
+{
+  try { impl_->usrp->set_tx_gain(db); } catch (...) {}
+}
+
 double RadioUhd::get_rx_gain() const
 {
   try { return impl_->usrp->get_rx_gain(); } catch (...) { return -1.0; }

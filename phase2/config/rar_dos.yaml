@@ -1,31 +1,45 @@
 # 5Gone Phase 2 — RAR DoS attacker config
 # Aligned with config/srsran/gnb_20mhz.yml (n78, 20 MHz, PCI 1, 23.04 MSPS)
 
-mode: sim  # sim | inject | live | bus | loopback | collide
+mode: prach  # sim | inject | live | prach | bus | loopback | collide
 
 dry_run: false
 
 radio:
   sample_rate: 23040000
-  center_freq_hz: 3489420000  # n78 dl_arfcn 632628 (real gNB) — matches srsRAN
+  center_freq_hz: 3489420000  # = dl_arfcn 632628 via srsRAN nr_arfcn_to_freq (TS 38.104 global raster: 3000 MHz + 15 kHz*(n-600000) = 3489.42 MHz). gNB LO (gnb_20mhz.yml) is tuned there too.
   tx_gain: 80
   rx_gain: 40
-  # Second B210 serial — gNB uses the first device
-  # 2-SDR PoC: attacker/victim owns "000000319"; gNB ("8001640") is srsRAN's.
-  device_args: "type=b200,serial=000000319,master_clock_rate=23.04e6,num_recv_frames=512,num_send_frames=512"
+  # Second B210 serial — gNB uses the first device (see config/srsran/gnb_20mhz.yml).
+  # 2-SDR PoC roles (original pair): gNB = "000000319", attacker = "8001640".
+  # Both boards proven TX+RX over the air via /tmp/sdrcheck.py (line +48..+50 dB).
+  device_args: "type=b200,serial=8001640,master_clock_rate=23.04e6,num_recv_frames=512,num_send_frames=512"
 
 cell:
   pci: 1
   scs_khz: 30
   bandwidth_mhz: 20
   band: 78
+  pss_bin_shift: -187  # VALIDATED 2026-09-18: live B210→B210 PSS lock corr=0.96 at shift -187
+                      # (SSB center = carrier -186 bins [3483.84 MHz], PSS center = -187).
+                      # CAUTION: nr_pss.cpp pss_time_reference() applies the shift phase
+                      # ramp ONLY when bin_shift != 0 (0 & +119 both leave PSS at +119 bins),
+                      # so shift 0 will NEVER lock a DC/PSS-at-0 reference - use -1 at SSB center.
   dl_arfcn: 632628
 
 attack:
   # Measured B210 cross-chain near-field loopback latency (Step 4): +7.5 µs.
   # TX must emit EARLY by this amount so the burst lands exactly on target.
-  symbol_advance_us: 8   # from loopback harness avg delay
+  symbol_advance_us: 500   # from loopback harness avg delay (8 µs is wrong for RF;
+                          # restored to the value that made gNB SSB lock → PRACH land)
   tx_power_scale: 1.5      # relative IQ scale before PA
+  # Path-2 live firing: scan_window DMRS-corr fence for a hit to become a Msg3.
+  # 0.9 matches the SIB-learning confidence floor and test_slot_scan's
+  # "live-fire level"; lower it only after confirming the no-DCI link's floor.
+  live_fire_corr: 0.9
+  # TcRntiTracker seed: gNB TC-RNTIs increment per RAR (observed 0x4601, ...).
+  # 0 = unseeded (fires with tc_rnti 0 — wrong scrambling, but the loop runs).
+  tc_rnti_seed: 17921   # 0x4601
 
 # Step 4 — loopback timing harness (single B210). Port map:
 #   TX/RX A = chain A switched TX port  -> TX (antenna 1)
@@ -60,6 +74,59 @@ collide:
   attack_scale: 2.0       # attack copy = 2*legit (2x louder already avoids clip; no DAC saturation)
   delay_symbols: [1.0, 3.0, 6.0, 9.0]   # attack arrives this many OFDM symbols late
   dump_path: /tmp/collide   # writes ctl.cf32 + att_d<N>_i<M>.cf32 windows (uncommented for offline analysis)
+
+# Step 5 — PRACH (Msg1) self-trigger (--mode prach). Broadcasts a B4 short ZC
+# preamble (L_RA=139, d_f_RA=30 kHz) on the lab gNB's PRACH occasion so the
+# gNB hands our loop a real RAR. Parameters match what srsRAN derives for this
+# cell (config index 159: x=1/y=0 -> every frame, subframe 9 -> 30 kHz slot 19,
+# symbol 0..11):
+#   - root 1 (l139), ZCZ 0 (Ncs=0 -> each RAPID is its own logical root)
+#   - msg1 SCS 30 kHz, fdm one, offset 6 PRBs + k_bar=2 from point A of the
+#     51-PRB/30 kHz BWP (center = cell ARFCN). The band is pre-shifted by +CFO
+#     (auto_cfo) so the gNB sees the preamble on its UL grid.
+prach:
+  enabled: true
+  rapid: 0
+  cycle_rapids: true   # claim (rapid+sent)%64 per send: same-rapid repeats go
+                       # quiet after the first answers; cycling keeps every
+                       # preamble looking like a new UE (maps gNB preamble=k
+                       # and MAC RAPID echoes back to exact sends)
+  root_sequence_index: 1
+  zero_correlation_zone: 0
+  msg1_frequency_start_prb: 6
+  occasion_slot: 16           # empirical. 11:14 boot sweep (mac_enable=false): slot 16
+                             # cfo 8000 -> sched 10/10 RAR grants; slot 13 cfo 12000 -> 6.
+                             # Re-sweep 0..19 if the gNB goes silent on a re-boot.
+  occasion_count: 120     # ride out low-phy drops + a full dither sweep
+  sweep_occasion_slots: true  # cycle occasion_slot 0..19 across sends within
+                               # one lock (ends the beam lottery: exactly one
+                               # slot maps to the gNB occasion per lock)
+  auto_cfo: false          # use manual center + dither (avoids per-run ±10 kHz swing)
+  cfo_comp_hz: 0          # base carrier: all historical detections (76+28 RARs)
+                          # were made with an UNSHIFTED burst (the old code
+                          # rounded any comp < 15 kHz to 0 bins, so the "8000
+                          # winner" won by phase luck, not frequency). With the
+                          # fractional NCO fix the comp is real now: an 8 kHz
+                          # comp detunes 8 kHz for real. Start at 0, tune ±1-2k
+                          # only if the hit rate demands it.
+  dither_cfo: false        # capture test: lock the comb-winning offset so every
+                           # frame is a hit and capture re-arms on the next burst
+  dither_halfspan_hz: 14000  # sweep center +/- this (Hz)
+  dither_step_hz: 1000       # 1 kHz steps, ~29 per pass (~580 ms)
+  # tx_gain_db: 30        # try lowering from radio.tx_gain if gNB shows
+                          # "PRACH request late" during the burst
+  rar_capture_dir: /tmp
+  rar_capture_window_slots: 5000  # ~2.5 s early window: captures run-start detections
+                                  # while the comb is still hot (detections cluster right
+                                  # after the probe, before LO drift kills the run)
+  rar_capture_pre_slots: 1  # file starts this many slots before the occasion
+                            # (raise to 60-100: early overflow jumps trim the
+                            # head and have twice eaten the RAR region)
+  # rar_capture_drain_sec: 2.0  # after occasion_count, drain the dilated gNB RAR
+                               # backlog this long at ~184 MB/s (df first!)
+  live_scan: true  # run the live RAR monitor on RX buffers (needed for live
+                   # mode; set false for pure capture runs: the scan is the
+                   # main RX-stall source and never fires on unaligned buffers)
 
 paths:
   iq_template_dir: phase2/iq_templates

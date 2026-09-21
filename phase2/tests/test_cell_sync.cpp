@@ -94,7 +94,7 @@ int main()
                res.strength, res.cfo_hz);
         CHECK(ok, "SSB found in clean slot");
         CHECK(res.slot_start == lead, "slot_start == lead-in length");
-        CHECK(res.pss_sample == lead + 3348, "PSS body start == lead + 3348");
+        CHECK(res.pss_sample == lead + 3354, "PSS body start == lead + 3354");
         CHECK(res.strength > 0.70f, "PSS/SSS FD correlation strong");
         CHECK(std::fabs(res.cfo_hz - cfo) < 50.0, "CFO estimated within 50 Hz");
         CHECK(sync.locked(), "lock set after find_ssb");
@@ -153,6 +153,146 @@ int main()
         bool ok = sync.find_ssb(buf, res);
         printf("[case4] wrong-pci found=%d strength=%.3f\n", ok, res.strength);
         CHECK(!ok, "no lock when configured for a different PCI");
+    }
+
+    // ---- 5) Global-frame lock: buffer-local SSB lock shifted into the
+    //          absolute RX-clock (live-mode Step 3 handshake) ----
+    {
+        Ofdm tx(srate, 30000, 51);
+        SampleBuffer buf = make_ssb_tx(tx, pci, 100, 4096, 0.0);   // SSB slot at 100
+
+        AttackConfig cfg;
+        CellSync sync(cfg);
+        SsbResult res;
+        CHECK(sync.find_ssb(buf, res), "clean slot detected");
+        CHECK(sync.frame_start_sample() == 100, "find_ssb locks buffer-local first");
+
+        // The receive stream told us this buffer began at absolute sample X.
+        const uint64_t rx_start = 123456789ull;
+        sync.set_frame_start_global(rx_start + res.slot_start);
+
+        const double sps = sync.samples_per_slot();
+        CHECK(sync.frame_start_sample() == rx_start + 100,
+              "frame start shifted into the global clock");
+        CHECK(sync.locked(), "lock survives the shift");
+
+        sync.set_rx_now(rx_start + 100);
+        CHECK(sync.current_slot().has_value() && *sync.current_slot() == 0,
+              "global frame start -> slot 0");
+        sync.set_rx_now(rx_start + 100 + (uint64_t)(3.0 * sps));
+        CHECK(sync.current_slot().has_value() && *sync.current_slot() == 3,
+              "3 slots later in absolute samples -> slot 3");
+        CHECK(std::fabs(sync.samples_to_next_ul_slot(4) - sps) < 1e-6,
+              "one slot of samples to slot 4");
+        sync.set_rx_now(rx_start + 100 + (uint64_t)(9.0 * sps));
+        CHECK(sync.samples_to_next_ul_slot(4) == 0.0,
+              "already past slot 4 -> 0 samples");
+        printf("[case5] global lock OK (frame_start=%llu)\n",
+               (unsigned long long)sync.frame_start_sample());
+    }
+
+    // ---- 6) Two-phase lock: a candidate must reproduce on the frame grid
+    //          for kVerifyHitsNeeded frames before it is confirmed (live TX
+    //          safety; a dead cell hands a spurious single-buffer lock) ----
+    {
+        Ofdm tx(srate, 30000, 51);
+        const uint64_t rx_base = 1ull << 33;
+        const std::size_t lead = 200;
+
+        AttackConfig cfg;
+        CellSync sync(cfg);
+        SsbResult res;
+        CHECK(sync.find_ssb(make_ssb_tx(tx, pci, lead, 4096, 0.0), res), "clean slot detected");
+        const double sps = sync.samples_per_slot();
+        const uint64_t F = sync.frame_samples();
+        CHECK(F == (uint64_t)(20.0 * sps), "frame period == 20 slots");
+        CHECK(sync.verify_in_progress(), "fresh lock starts as unconfirmed candidate");
+        CHECK(sync.locked(), "candidate keeps cell lock active");
+
+        // Shift the lock into the global clock, then feed three frame-aligned
+        // buffers that reproduce the SSB at the same absolute position.
+        sync.set_frame_start_global(rx_base + lead);
+        CellSync::VerifyEvent ev = CellSync::VerifyEvent::Idle;
+        for (unsigned k = 1; k <= 3; ++k) {
+            const uint64_t buf_start = rx_base + k * F;
+            ev = sync.verify_frame(make_ssb_tx(tx, pci, lead, 4096, 0.0),
+                                   buf_start, 3ull * (uint64_t)sps);
+            CHECK(ev != CellSync::VerifyEvent::Broken, "grid hit must not break the lock");
+        }
+        CHECK(ev == CellSync::VerifyEvent::Confirmed, "3 reproductions confirm the lock");
+        CHECK(!sync.verify_in_progress(), "confirmed lock leaves the pending stage");
+        CHECK(sync.locked(), "confirmed lock is active");
+        CHECK(sync.cfo_frames() >= 4, "verify frames folded into the CFO average");
+
+        // ssb_reproduced_here() grid arithmetic, in isolation.
+        CHECK(sync.ssb_reproduced_here(rx_base + lead, 10), "SSB at frame start");
+        CHECK(sync.ssb_reproduced_here(rx_base + lead + 3 * F, 10), "SSB k frames later");
+        CHECK(sync.ssb_reproduced_here(rx_base + lead - 5, 10), "just before frame start (wrap)");
+        CHECK(!sync.ssb_reproduced_here(rx_base + lead + F / 2, 10), "half-frame off grid");
+        CHECK(!sync.ssb_reproduced_here(rx_base + lead + 7 * (uint64_t)sps, 3ull * (uint64_t)sps),
+              "7 slots off-grid beyond tolerance");
+        printf("[case6] two-phase lock verified: F=%llu sps=%.0f hits confirmed after 3 frames\n",
+               (unsigned long long)F, sps);
+    }
+
+    // ---- 7) A candidate that never reproduces (no cell / noise) is dropped ----
+    {
+        Ofdm tx(srate, 30000, 51);
+        const uint64_t rx_base = 1ull << 29;
+        const std::size_t lead = 100;
+
+        AttackConfig cfg;
+        CellSync sync(cfg);
+        SsbResult res;
+        CHECK(sync.find_ssb(make_ssb_tx(tx, pci, lead, 4096, 0.0), res), "clean slot detected");
+        sync.set_frame_start_global(rx_base + lead);
+        const uint64_t F = sync.frame_samples();
+        const double sps = sync.samples_per_slot();
+
+        CellSync::VerifyEvent ev;
+        ev = sync.verify_frame(make_noise(16384), rx_base + 2 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Pending && sync.locked(),
+              "first noise frame: still pending");
+        ev = sync.verify_frame(make_noise(16384), rx_base + 3 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Pending && sync.locked(),
+              "second noise frame: still pending");
+        ev = sync.verify_frame(make_noise(16384), rx_base + 4 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Broken, "third noise frame drops the lock");
+        CHECK(!sync.locked(), "lock dropped after kVerifyMissLimit misses");
+        CHECK(!sync.verify_in_progress(), "no pending verify after drop");
+        CHECK(sync.verify_frame(make_noise(16384), rx_base + 5 * F, 3ull * (uint64_t)sps) ==
+              CellSync::VerifyEvent::Idle, "verify after drop is idle");
+        printf("[case7] noise frame reject OK (lock dropped, back to rescan)\n");
+    }
+
+    // ---- 8) An SSB that lands off the locked grid position is a miss ----
+    {
+        Ofdm tx(srate, 30000, 51);
+        const uint64_t rx_base = 1ull << 31;
+        const std::size_t lead = 300;
+        const double sps = (double)tx.samples_per_slot();
+
+        AttackConfig cfg;
+        CellSync sync(cfg);
+        SsbResult res;
+        CHECK(sync.find_ssb(make_ssb_tx(tx, pci, lead, 4096, 0.0), res), "clean slot detected");
+        sync.set_frame_start_global(rx_base + lead);
+        const uint64_t F = sync.frame_samples();
+        // SSB shifted 7 slots forward in the frame -> outside the 3-slot tolerance.
+        const std::size_t shift_lead = lead + (std::size_t)(7.0 * sps);
+
+        CellSync::VerifyEvent ev;
+        ev = sync.verify_frame(make_ssb_tx(tx, pci, shift_lead, 4096, 0.0),
+                               rx_base + 1 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Pending, "off-grid frame 1: pending");
+        ev = sync.verify_frame(make_ssb_tx(tx, pci, shift_lead, 4096, 0.0),
+                               rx_base + 2 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Pending, "off-grid frame 2: pending");
+        ev = sync.verify_frame(make_ssb_tx(tx, pci, shift_lead, 4096, 0.0),
+                               rx_base + 3 * F, 3ull * (uint64_t)sps);
+        CHECK(ev == CellSync::VerifyEvent::Broken, "off-grid frame 3 drops the lock");
+        CHECK(!sync.locked(), "off-grid SSB refused");
+        printf("[case8] off-grid SSB reject OK\n");
     }
 
     printf("done: %d failure(s)\n", g_fail);
