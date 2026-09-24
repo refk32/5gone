@@ -238,7 +238,42 @@ if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
 endif()
 target_link_libraries(test_slot_scan PRIVATE m)
 
-# --- RAR UL grant decoder unit test (portable, no UHD/srsRAN) ---
+# --- Null-calibration regression test (portable, no UHD/srsRAN) ---
+# R1/P2 defect: "empty" captures scored as high as a real PDCCH because the
+# CORESET-sweep and RarMonitor-grid accept fiddles used ABSOLUTE correlation
+# thresholds that max-of-extreme statistics on pure noise can reach, then
+# decoded zero DCI. The fix measures each grid's own null floor on a synthetic
+# noise window and requires the winner to clear it by a margin. Pins:
+#   noise sweep -> not accepted, null floor reported;
+#   RAR sweep   -> accepted (corr ~1.0) and DCI observations present;
+#   monitor grid-> never fires / fills a SIB bucket on noise, fires on the RAR.
+set(NULLCAL_TEST_SRC
+  "${CMAKE_SOURCE_DIR}/tests/test_null_calibration.cpp"
+  "${CMAKE_SOURCE_DIR}/tools/decode_capture.hpp"
+  "${CMAKE_SOURCE_DIR}/src/cell_sync.cpp"
+  "${CMAKE_SOURCE_DIR}/src/rar_monitor.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_tx.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_rar_decoder.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdcch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dci.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dmrs.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pn.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_dsp.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_symbol.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_ofdm.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pdsch.cpp"
+  "${CMAKE_SOURCE_DIR}/src/mac_rar.cpp"
+  "${CMAKE_SOURCE_DIR}/src/nr_pss.cpp")
+add_executable(test_null_calibration ${NULLCAL_TEST_SRC})
+target_include_directories(test_null_calibration PRIVATE
+  "${CMAKE_SOURCE_DIR}/include"
+  "${CMAKE_SOURCE_DIR}")
+if(LIQUID_LIBRARY AND LIQUID_INCLUDE_DIR)
+  target_compile_definitions(test_null_calibration PRIVATE HAVE_LIQUID=1)
+  target_include_directories(test_null_calibration PRIVATE ${LIQUID_INCLUDE_DIR})
+  target_link_libraries(test_null_calibration PRIVATE ${LIQUID_LIBRARY})
+endif()
+target_link_libraries(test_null_calibration PRIVATE m)
 # Pure TS 38.213 Tab 8.2-1 RAR-grant bit decoding (live-mode Step 1). Links
 # only mac_rar.cpp + nr_dci.cpp (riv_decode), so it builds on the Mac workspace
 # too — on the Latte it additionally documents parity with the srsRAN-4G MAC

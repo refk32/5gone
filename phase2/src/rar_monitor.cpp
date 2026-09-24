@@ -1,6 +1,7 @@
 #include "5gone/rar_monitor.hpp"
 #include "5gone/mac_rar.hpp"
 #include "5gone/nr_rar_decoder.hpp"
+#include "5gone/nr_capture.hpp"
 #include "5gone/nr_constants.hpp"
 #include "5gone/nr_coreset.hpp"
 #include "5gone/nr_ofdm.hpp"
@@ -264,6 +265,52 @@ void RarMonitor::ensure_grid()
   }
 }
 
+float RarMonitor::null_floor() const
+{
+  return null_ready_ ? null_floor_ : 0.0f;
+}
+
+float RarMonitor::fire_floor() const
+{
+  // Live-fire / SIB-learning fence: max(live_fire_corr config, grid's measured
+  // noise floor + margin). Calibrated against the B210 near-field rig: real
+  // PDCCH DM-RS saturates at ~0.85-0.91 (live SIB region measures 0.74-0.91),
+  // NOT the idealized ~1.0. A +0.15 margin was tuned for a clean ~1.0
+  // correlator and put the gate (0.989) ABOVE the hardware signal ceiling, so
+  // a real RAR could never clear it. RAR-window membership (P2-5) already
+  // gates firing to 4 slots after our occasion, so a leaner margin is safe:
+  // the periodic SIB sits at a fixed slot outside that window.
+  const float floor = null_ready_ ? null_floor_ : 0.9f;
+  return std::max(cfg_.live_fire_corr, floor + 0.04f);
+}
+
+void RarMonitor::ensure_null_floor()
+{
+  if (null_ready_) return;
+  ensure_grid();
+  if (grid_.empty()) return;
+  // Same samples-per-slot and demod path scan_window() uses, on a synthetic
+  // noise window of the same span (2 full slots). The grid's largest
+  // correlation over pure noise is the calibration datum for fire_floor().
+  const uint16_t bwp = bwp_prbs_from_cfg(cfg_);
+  nr::Ofdm ofdm(cfg_.sample_rate,
+                static_cast<double>(cfg_.scs_khz) * 1000.0, bwp);
+  const size_t span = 2u * ofdm.samples_per_slot();
+  SampleBuffer noise = nr::synth_noise_hash(span, 0.5f);
+  auto symbols = ofdm.demodulate(noise, 0);
+  float mx = 0.0f;
+  for (const auto& g : grid_) {
+    auto found = g.pdcch->process(symbols, 0);
+    for (const auto& d : found)
+      if (d.correlation > mx) mx = d.correlation;
+  }
+  null_floor_ = mx;
+  null_ready_ = true;
+  std::printf("[rar-scan] null-calibrated: grid noise floor = %.4f, "
+              "fire gate = %.4f\n",
+              null_floor_, fire_floor());
+}
+
 std::vector<RarMonitor::SlotHit> RarMonitor::scan_window(
     const SampleBuffer& iq, uint64_t abs_start, uint64_t frame_start,
     double sps, double cfo_hz)
@@ -338,13 +385,30 @@ std::vector<RarMonitor::SlotHit> RarMonitor::scan_window(
 
 void RarMonitor::note_hits_for_sib(const std::vector<SlotHit>& hits)
 {
-  // Confident hits only (>= 0.9): learning weak hits would pollute buckets
-  // with noise. Note this is REPORTING, not a firing veto — a veto here
-  // would self-blind on our own periodic occasions landing on a learned
-  // bucket. P2-5 gates firing on RAR-window membership, never on SIB veto.
+  // Confident hits only: the grid's null-calibrated fire fence, not an
+  // absolute 0.9 (which the max-of-extreme grid correlation reaches on pure
+  // noise — null calibrate once so buckets never fill from an empty link).
+  // Note this is REPORTING, not a firing veto — a veto here would self-blind
+  // on our own periodic occasions landing on a learned bucket. P2-5 gates
+  // firing on RAR-window membership, never on SIB veto.
+  ensure_null_floor();
+  const float fence = fire_floor();
+  // Diagnostic: below-fence hits are the RAR DMRS arriving weak (DL coupling
+  // still too low to clear the fire gate). Surface the strongest one per scan
+  // call so "RAR on air but sub-gate" is visible instead of silently dropped.
+  const SlotHit* top_sub = nullptr;
   for (const auto& h : hits) {
-    if (h.corr < 0.9f) continue;
+    if (h.corr < fence) {
+      if (!top_sub || h.corr > top_sub->corr) top_sub = &h;
+      continue;
+    }
     sib_slots_[h.abs_slot % 40u].insert(h.abs_slot);
+  }
+  if (top_sub) {
+    std::printf("[rar-scan] sub-gate top: corr=%.3f @slot=%llu (al=%u, "
+                "fence=%.3f)\n",
+                top_sub->corr, (unsigned long long)top_sub->abs_slot,
+                (unsigned)top_sub->al, fence);
   }
 }
 

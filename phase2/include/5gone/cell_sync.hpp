@@ -84,8 +84,13 @@ public:
   // after frame. launch path: no TX while verify_in_progress().
   enum class VerifyEvent { Idle, Pending, Confirmed, Broken };
 
-  static constexpr unsigned kVerifyHitsNeeded = 3;   // consecutive grid hits
-  static constexpr unsigned kVerifyMissLimit  = 3;   // drop the lock after these
+  static constexpr unsigned kVerifyHitsNeeded = 3;   // grid reproductions
+  // The frame-ring verify now judges EVERY frame (no phase-lottery skips), so a
+  // gNB RF-underflow drop or an RX-overflow frame counts as one miss. The gNB's
+  // chronic underflow bursts drop several frames in a row, so keep this well
+  // above the worst real-cell burst; a truly dead cell reproduces nowhere and
+  // still trips the limit in <0.5 s.
+  static constexpr unsigned kVerifyMissLimit  = 12;  // drop the lock after these
 
   // Called automatically by find_ssb() when a lock is established. Idempotent.
   void start_lock_verify()
@@ -111,6 +116,13 @@ public:
   // (frame_start_sample() + k * frame_period, tolerance `tol_samples`).
   bool ssb_reproduced_here(uint64_t cand_abs, uint64_t tol_samples) const;
 
+  // Next grid SSB start at/after the given absolute sample.
+  uint64_t next_grid_slot_after(uint64_t sample) const;
+
+  // True when a buffer spanning [buf_gs, buf_gs+buf_len) fully contains the
+  // next grid SSB slot (so verify_frame can actually judge the frame).
+  bool grid_slot_contained(uint64_t buf_gs, uint64_t buf_len) const;
+
 private:
   AttackConfig cfg_;
   nr::Ofdm ofdm_;
@@ -128,7 +140,13 @@ private:
   void drop_verify() { locked_ = false; verify_hits_ = 0; verify_misses_ = 0; }
   // locate_ssb() = the TD search + FD verify + CP correlation shared by
   // find_ssb() (locks the frame, seeds the accumulator) and refine_cfo().
-  bool locate_ssb(const SampleBuffer& iq, SsbResult& out, std::complex<double>& cp_corr);
+  // `min_peak_ratio` is the TD PSS peak/mean floor. Acquisition (find_ssb)
+  // uses the strict kMinPeakRatio; verify_frame() may relax it because it
+  // additionally tests the known grid position + FD sequence correlation, so a
+  // weak-but-real SSB that dips below the acquisition pre-filter on a single
+  // frame is still scored (a dead cell never reproduces on the grid either way).
+  bool locate_ssb(const SampleBuffer& iq, SsbResult& out,
+                  std::complex<double>& cp_corr, double min_peak_ratio);
 };
 
 } // namespace gone

@@ -88,8 +88,14 @@ public:
 
     // Expose the OFDM stage so a sweep demodulates the window ONCE and then
     // re-scans it under many CORESET configs (slot labels are patched in place).
+    // `cfo_hz` (>0) removes a residual carrier offset before demodulating; the
+    // sweep callers MUST pass it here — the DM-RS correlation smears to noise
+    // on this rig's ~4-5 kHz residual CFO otherwise (the old sweep path
+    // only corrected CFO in decode(), never in demodulate(), so --coreset-sweep
+    // could never see a real PDCCH on live captures).
     std::vector<Symbol> demodulate(const std::vector<std::complex<float>>& iq,
-                                   uint32_t starting_slot_in_frame);
+                                   uint32_t starting_slot_in_frame,
+                                   double cfo_hz = 0.0);
 
     // Correlation-only scan: every candidate above a 0 floor is returned with
     // its DM-RS correlation score (no polar/CRC). Cheap enough to call per

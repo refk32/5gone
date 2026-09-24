@@ -83,6 +83,34 @@ inline std::vector<std::complex<float>> synth_noise(std::size_t n)
     return b;
 }
 
+// Deterministic complex white noise (splitmix64 hash), lattice-free, for
+// null-calibrating correlation gates. An LCG lattice once produced 0.95+
+// spurious correlations through the 120-config grid; splitmix64 does not.
+// Amp scales both I/Q; the normalized correlator is amplitude-invariant, so
+// amp only sets the in-band level relative to any signal.
+inline std::vector<std::complex<float>> synth_noise_hash(std::size_t n,
+                                                         float amp = 1.0f,
+                                                         uint64_t seed = 0x9E3779B97F4A7C15ull)
+{
+    std::vector<std::complex<float>> b(n);
+    uint64_t st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+        uint64_t z = (st += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= (z >> 31);
+        const float u = (float)((double)(z >> 11) / (double)(1ull << 53));
+        z = (st += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= (z >> 31);
+        const float v = (float)((double)(z >> 11) / (double)(1ull << 53));
+        b[i] = std::complex<float>((u - 0.5f) * 2.0f * amp,
+                                   (v - 0.5f) * 2.0f * amp);
+    }
+    return b;
+}
+
 // Compose a capture: [noise preamble of `preamble` samples] + `slots` SSB slots.
 // When pci==0, returns only the noise preamble (idle-cell simulation).
 // The preamble is kept SMALL relative to one slot so tests stay fast while the

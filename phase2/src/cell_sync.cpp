@@ -20,6 +20,12 @@ namespace {
 // the FD gate is the real disambiguator, the TD ratio gate is only a pre-filter.
 constexpr float kMinFdCorr = 0.15f;
 constexpr double kMinPeakRatio = 3.0;
+// TD PSS peak/mean floor for lock VERIFICATION. Much lower than acquisition's:
+// verify additionally requires the hit on the known grid position AND the FD
+// sequence correlation (kMinFdCorr), so a real-but-marginal SSB that dips below
+// the blink-and-you-miss-it acquisition pre-filter still registers a reproduce
+// hit. A dead cell never lands on the grid 3x, so confidence is preserved.
+constexpr double kMinVerifyPeakRatio = 1.5;
 
 const double kTwoPi = 2.0 * std::acos(-1.0);
 } // namespace
@@ -41,7 +47,7 @@ bool CellSync::find_ssb(const SampleBuffer& iq, SsbResult& out)
 {
   out = SsbResult{};
   std::complex<double> cp_corr(0.0, 0.0);
-  if (!locate_ssb(iq, out, cp_corr)) return false;
+  if (!locate_ssb(iq, out, cp_corr, kMinPeakRatio)) return false;
 
   // 5) Lock the frame on the SSB slot and seed the CFO accumulator with the
   //    first estimate. The caller shifts frame_start_sample_ into the global
@@ -55,7 +61,7 @@ bool CellSync::find_ssb(const SampleBuffer& iq, SsbResult& out)
 }
 
 bool CellSync::locate_ssb(const SampleBuffer& iq, SsbResult& out,
-                          std::complex<double>& cp_corr)
+                          std::complex<double>& cp_corr, double min_peak_ratio)
 {
   out = SsbResult{};
 
@@ -88,12 +94,12 @@ bool CellSync::locate_ssb(const SampleBuffer& iq, SsbResult& out,
   }
   const double mean_mag = sum_mag / static_cast<double>(corr.size());
   const double peak_ratio = mean_mag > 0.0 ? peak_mag / mean_mag : 0.0;
-  if (peak_mag < kMinPeakRatio * mean_mag) {
+  if (peak_mag < min_peak_ratio * mean_mag) {
     // Nothing SSB-like in this window. Only print when there is *some* energy
     // (so pure-silence windows stay quiet).
     if (peak_ratio > 1.5) {
       std::printf("[cell-sync] no lock: TD PSS peak ratio=%.2f (< %.1f gate) — "
-                  "check freq/antennas/%zu-sample window\n", peak_ratio, kMinPeakRatio, iq.size());
+                  "check freq/antennas/%zu-sample window\n", peak_ratio, min_peak_ratio, iq.size());
     }
     return false;
   }
@@ -204,7 +210,7 @@ bool CellSync::refine_cfo(const SampleBuffer& iq, SsbResult& out)
 {
   out = SsbResult{};
   std::complex<double> cp_corr(0.0, 0.0);
-  if (!locate_ssb(iq, out, cp_corr)) return false;
+  if (!locate_ssb(iq, out, cp_corr, kMinPeakRatio)) return false;
   // The phase of the running sum is the mean CFO over ALL refined frames, so
   // a single unlucky noisy slot no longer dictates the carrier we transmit on.
   cfo_acc_ += cp_corr;
@@ -220,12 +226,50 @@ CellSync::VerifyEvent CellSync::verify_frame(const SampleBuffer& iq,
   if (!locked_) return VerifyEvent::Idle;
   SsbResult vr;
   std::complex<double> cp_corr(0.0, 0.0);
-  const bool found = locate_ssb(iq, vr, cp_corr);
+
+  // The verify buffer is a rolling, sub-frame-sized RX window, so the locked
+  // grid SSB slot is only occasionally fully inside it. Only judge the frame
+  // when the slot actually fits; otherwise skip WITHOUT a miss so a healthy
+  // cell is not rejected just because the rolling window missed the slot.
+  const uint64_t slot = static_cast<uint64_t>(ofdm_.samples_per_slot());
+  if (!grid_slot_contained(buf_global_start, iq.size())) {
+    if (getenv("GONE_VERIFY_DBG")) {
+      const uint64_t S = next_grid_slot_after(buf_global_start);
+      std::printf("[verify] skip: buf_gs=%llu len=%zu slot@%llu not contained "
+                  "(needs [%llu,%llu]) hits=%d misses=%d\n",
+                  static_cast<unsigned long long>(buf_global_start), iq.size(),
+                  static_cast<unsigned long long>(S),
+                  static_cast<unsigned long long>(S),
+                  static_cast<unsigned long long>(S + slot),
+                  verify_hits_, verify_misses_);
+    }
+    return VerifyEvent::Pending;   // wait for a frame whose slot is in-buffer
+  }
+
+  const bool found = locate_ssb(iq, vr, cp_corr, kMinVerifyPeakRatio);
   // The SSB must land on the locked grid position (frame_start_sample() +
   // k * frame period). A real cell reproduces there every frame; a dead cell
   // (or a shifted/noise hit) drifts off it and the lock must NOT be trusted.
+  //
+  // Three outcomes are distinguished:
+  //  - on-grid hit:        proof of life; accumulates toward CONFIRMED.
+  //  - found but off-grid: genuine drift / wrong cell / shifted noise; the hit
+  //                        streak is wiped (the grid hypothesis is falsified).
+  //  - not found:          frame absence only. The gNB's chronic RF underflow
+  //                        drops entire frames, so absence must NOT wipe the
+  //                        hits already accrued; it only counts toward the drop
+  //                        limit so a dead cell still gets rejected.
   const bool on_grid = found &&
                        ssb_reproduced_here(buf_global_start + vr.slot_start, tol_samples);
+  if (getenv("GONE_VERIFY_DBG")) {
+    std::printf("[verify] buf_gs=%llu found=%d str=%.3f slot_start=%llu fs=%llu "
+                "grid=%d cur_hits=%d/%d misses=%d/%d\n",
+                static_cast<unsigned long long>(buf_global_start), found ? 1 : 0,
+                vr.strength, static_cast<unsigned long long>(vr.slot_start),
+                static_cast<unsigned long long>(frame_start_sample_),
+                on_grid ? 1 : 0, verify_hits_, kVerifyHitsNeeded,
+                verify_misses_, kVerifyMissLimit);
+  }
   if (on_grid) {
     verify_hits_   += 1;
     verify_misses_  = 0;
@@ -234,8 +278,8 @@ CellSync::VerifyEvent CellSync::verify_frame(const SampleBuffer& iq,
     return (verify_hits_ >= kVerifyHitsNeeded) ? VerifyEvent::Confirmed
                                                : VerifyEvent::Pending;
   }
+  if (found) verify_hits_ = 0;          // off-grid finding: grid falsified
   verify_misses_ += 1;
-  verify_hits_    = 0;
   if (verify_misses_ >= kVerifyMissLimit) {
     drop_verify();
     return VerifyEvent::Broken;
@@ -252,6 +296,26 @@ bool CellSync::ssb_reproduced_here(uint64_t cand_abs, uint64_t tol_samples) cons
   const uint64_t d  = (cand_abs >= fs) ? (cand_abs - fs) % period
                                        : (fs - cand_abs) % period;
   return (d <= tol_samples) || (period - d <= tol_samples);
+}
+
+uint64_t CellSync::next_grid_slot_after(uint64_t sample) const
+{
+  const uint64_t fs = frame_start_sample_;
+  const uint64_t frame = frame_samples();
+  if (frame == 0) return sample;
+  if (sample <= fs) return fs;
+  const uint64_t d = sample - fs;
+  const uint64_t k = d / frame + (d % frame != 0 ? 1u : 0u);
+  return fs + k * frame;
+}
+
+bool CellSync::grid_slot_contained(uint64_t buf_gs, uint64_t buf_len) const
+{
+  if (!locked_) return false;
+  const uint64_t slot = static_cast<uint64_t>(ofdm_.samples_per_slot());
+  if (slot == 0) return false;
+  const uint64_t S = next_grid_slot_after(buf_gs);
+  return (S >= buf_gs) && (S + slot <= buf_gs + buf_len);
 }
 
 double CellSync::cfo_avg_hz() const

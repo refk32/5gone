@@ -2,6 +2,7 @@
 
 #include "5gone/nr_constants.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -151,19 +152,30 @@ int main(int argc, char** argv)
                     "over %zu slots -> accepted=%s",
                     r.sweep_configs, p.sweep_slots ? p.sweep_slots : 100,
                     r.sweep_accepted ? "yes" : "no");
+        std::printf(" (null_floor=%.4f gate=%.4f)",
+                    r.sweep_null_floor, r.sweep_null_gate);
         if (!r.sweep_accepted) {
             // Say exactly why: the accept gate needs corr >= 0.75 or
-            // (corr >= min AND hits >= 5); a lone 0.6x AL1 max is the
-            // noise floor over ~100M correlations, not a detection.
+            // (corr >= min AND hits >= 5), AND the winner must clear the
+            // grid's measured null floor by a margin; a lone 0.6x AL1 max is
+            // the noise floor over ~100M correlations, not a detection.
             if (!r.sweep.empty()) {
                 const auto& b = r.sweep.front();
-                std::printf(" (best corr=%.4f hits=%u; need >=0.75 or >=%.2f with >=5 hits)",
-                            b.corr, (unsigned)b.hits, p.sweep_min_corr);
+                std::printf(" (best corr=%.4f hits=%u; need >=%.2f or >=%.2f with >=5 hits)",
+                            b.corr, (unsigned)b.hits,
+                            std::max(0.75f, r.sweep_null_gate),
+                            std::max(p.sweep_min_corr, r.sweep_null_gate));
             } else {
                 std::printf(" (no candidates above zero)");
             }
         }
         std::printf("\n");
+        if (r.sweep_completed) {
+            std::printf("[5gone-decode]   per-AL best corr: AL1=%.4f AL2=%.4f AL4=%.4f "
+                        "AL8=%.4f AL16=%.4f\n",
+                        r.sweep_al_best[0], r.sweep_al_best[1], r.sweep_al_best[2],
+                        r.sweep_al_best[3], r.sweep_al_best[4]);
+        }
         for (size_t i = 0; i < r.sweep.size(); ++i) {
             const auto& h = r.sweep[i];
             std::printf("  #%02zu corr=%.4f hits=%u %s PRBs=%u@%u dur=%u shift=%u "

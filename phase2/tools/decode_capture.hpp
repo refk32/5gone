@@ -1,10 +1,13 @@
 #pragma once
 
 #include "5gone/cell_sync.hpp"
+#include "5gone/nr_capture.hpp"
+#include "5gone/nr_pss.hpp"
 #include "5gone/nr_rar_decoder.hpp"
 #include "5gone/nr_ofdm.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -50,6 +53,7 @@ struct DecodeParams {
     bool coreset_sweep     = false;
     size_t sweep_slots     = 100;  // window (slots) the sweep scans
     float  sweep_min_corr  = 0.6f; // only accept a config at/above this corr
+    float  sweep_null_margin = 0.15f; // accept must beat the grid's noise floor by this
     bool   sweep_wide      = false;// add 32/24-PRB CORESETs and duration 2
     // Single explicit CORESET override (when !coreset_sweep):
     uint16_t coreset_prbs  = 0;    // PRB count; 0 = BWP size
@@ -75,6 +79,14 @@ struct DecodeResult {
     bool sweep_accepted  = false;
     std::vector<CoresetSweepHit> sweep;
     size_t sweep_configs = 0;   // number of CORESET variants tried
+    std::array<float, 5> sweep_al_best{};  // per-AL {1,2,4,8,16} best corr over the grid
+    // Null-calibrated accept: the same (config x offset) grid's largest
+    // correlation on a synthetic noise window of the same length. Acceptance
+    // demands the winner CLEAR the noise floor by a margin, not just beat a
+    // fixed absolute value (the fixed gates let max-of-extreme correlations
+    // on "empty" captures score as high as a real PDCCH).
+    float sweep_null_floor = 0.0f;
+    float sweep_null_gate  = 0.0f;
 };
 
 // Build the Coreset for an explicit (non-sweep) override, or the default.
@@ -139,7 +151,7 @@ inline std::vector<nr::Coreset> coreset_sweep_grid(const DecodeParams& p, bool w
         for (uint16_t off = 0; off <= max_off; ++off) {
             for (uint8_t dur : durs) {
                 for (bool interleaved : maps) {
-                    for (uint16_t shift = 0; shift < 3; ++shift) {
+                    for (uint16_t shift = 0; shift <= static_cast<uint16_t>(std::max(2u, (bwp / (6u * 2u)) - 1u)); ++shift) {
                         nr::Coreset cs;
                         cs.control_resourceset_id = 1;
                         cs.frequency_domain_resources = f;
@@ -223,6 +235,33 @@ inline DecodeResult decode_capture(const DecodeParams& p)
         SampleBuffer slice(iq.begin() + static_cast<std::ptrdiff_t>(slice_start),
                            iq.begin() + static_cast<std::ptrdiff_t>(slice_start + decode_len));
 
+        // The attacker RX is tuned to the gNB CARRIER, so the SSB (and the whole
+        // BWP) arrives offset by pss_bin_shift subcarriers from DC (cell_sync
+        // and rx_probe measure this; ~-220 for this cell). Ofdm::demodulate maps
+        // FFT bins 0..num_subcarriers straight onto the BWP, so without this
+        // rotation the PDCCH grid is scanned N bins (=~339 here) away from the
+        // real signal and every DM-RS correlation flattens to the ~0.6 noise
+        // floor. cell_sync.cpp applies the same rotation for its slot verify;
+        // do it here for the whole slice so both decode() and the CORESET sweep
+        // see an aligned grid. `--shift` becomes a dial for the exact offset.
+        if (p.pss_bin_shift != 0) {
+            const int rot_bins = static_cast<int>(nr::kPssFirstSub + nr::kPssLen / 2) -
+                                 p.pss_bin_shift;   // 119 - bin_shift
+            const nr::Ofdm ofdm_tmp(p.sample_rate, static_cast<double>(p.scs_hz),
+                                    p.bwp_prbs);
+            const double twopi = 2.0 * std::acos(-1.0);
+            const double step_ph = twopi * rot_bins / static_cast<double>(ofdm_tmp.fft_size());
+            std::complex<double> ph(1.0, 0.0);
+            const std::complex<double> step(std::cos(step_ph), std::sin(step_ph));
+            for (auto& v : slice) {
+                const std::complex<float> c(v);
+                v = std::complex<float>(
+                    static_cast<float>(c.real() * ph.real() - c.imag() * ph.imag()),
+                    static_cast<float>(c.real() * ph.imag() + c.imag() * ph.real()));
+                ph *= step;
+            }
+        }
+
         nr::RarDecoder dec(p.sample_rate, p.scs_hz, p.pci, p.bwp_prbs, p.verbose);
 
         if (p.coreset_sweep) {
@@ -239,58 +278,92 @@ inline DecodeResult decode_capture(const DecodeParams& p)
             win_len -= win_len % slot_samples;   // whole slots (slice starts slot-aligned)
             const SampleBuffer win(slice.begin(),
                                    slice.begin() + static_cast<std::ptrdiff_t>(win_len));
-            auto symbols = dec.demodulate(win, 0);
-            std::vector<uint8_t> orig_slot(symbols.size());
-            for (size_t i = 0; i < symbols.size(); ++i) orig_slot[i] = symbols[i].slot_index;
+            auto symbols = dec.demodulate(win, 0, p.cfo_hz);
 
             auto grid = coreset_sweep_grid(p, p.sweep_wide);
             r.sweep_configs = grid.size();
 
-            std::vector<CoresetSweepHit> hits;
-            hits.reserve(grid.size() * 4);
-            for (const nr::Coreset& cs : grid) {
-                dec.set_coreset(cs);
-                for (uint32_t off20 = 0; off20 < 20; ++off20) {
-                    for (size_t i = 0; i < symbols.size(); ++i)
-                        symbols[i].slot_index = static_cast<uint8_t>((orig_slot[i] + off20) % 20);
-                    auto found = dec.scan_pdcch(symbols);
-                    CoresetSweepHit best;
-                    best.offset = static_cast<uint8_t>(off20);
-                    best.start_prb = cs.start_prb;
-                    best.freq_prbs = cs.frequency_domain_resources;
-                    best.duration = cs.duration;
-                    best.shift_index = cs.shift_index;
-                    best.interleaved = cs.cce_reg_mapping_type == "interleaved";
-                    for (const auto& d : found) {
-                        if (d.correlation >= p.sweep_min_corr) best.hits++;
-                        if (d.correlation > best.corr) {
-                            best.corr = d.correlation;
-                            best.slot = d.n_slot;
-                            best.symbol = d.n_ofdm;
-                            best.al = d.found_aggregation_level;
-                            best.candidate = d.found_candidate;
+            // Scan the window under every config x slot-offset; returns the
+            // best hit per (config, offset), sorted best-first.
+            auto scan_all = [&](std::vector<nr::Symbol> syms) {
+                std::vector<uint8_t> orig_slot(syms.size());
+                for (size_t i = 0; i < syms.size(); ++i)
+                    orig_slot[i] = syms[i].slot_index;
+                std::vector<CoresetSweepHit> hits;
+                hits.reserve(grid.size() * 4);
+                for (const nr::Coreset& cs : grid) {
+                    dec.set_coreset(cs);
+                    for (uint32_t off20 = 0; off20 < 20; ++off20) {
+                        for (size_t i = 0; i < syms.size(); ++i)
+                            syms[i].slot_index =
+                                static_cast<uint8_t>((orig_slot[i] + off20) % 20);
+                        auto found = dec.scan_pdcch(syms);
+                        CoresetSweepHit best;
+                        best.offset = static_cast<uint8_t>(off20);
+                        best.start_prb = cs.start_prb;
+                        best.freq_prbs = cs.frequency_domain_resources;
+                        best.duration = cs.duration;
+                        best.shift_index = cs.shift_index;
+                        best.interleaved = cs.cce_reg_mapping_type == "interleaved";
+                        for (const auto& d : found) {
+                            if (d.correlation >= p.sweep_min_corr) best.hits++;
+                            if (d.correlation > best.corr) {
+                                best.corr = d.correlation;
+                                best.slot = d.n_slot;
+                                best.symbol = d.n_ofdm;
+                                best.al = d.found_aggregation_level;
+                                best.candidate = d.found_candidate;
+                            }
+                            const unsigned al_lg =
+                                d.found_aggregation_level ? 31u - __builtin_clz(d.found_aggregation_level) : 0u;
+                            if (al_lg < 5 && d.correlation > r.sweep_al_best[al_lg])
+                                r.sweep_al_best[al_lg] = static_cast<float>(d.correlation);
                         }
+                        if (best.corr > 0.0) hits.push_back(best);
                     }
-                    if (best.corr > 0.0) hits.push_back(best);
                 }
+                std::sort(hits.begin(), hits.end(), [](const CoresetSweepHit& a,
+                                                       const CoresetSweepHit& b) {
+                    return a.corr > b.corr;
+                });
+                return hits;
+            };
+
+            auto hits = scan_all(symbols);
+
+            // ---- Null calibration ----
+            // The same grid over a synthetic noise window gives the largest
+            // correlation pure noise produces for THIS (config x offset x
+            // candidates x symbols) trial count. Absolute gates alone let that
+            // max-of-extreme climb past 0.9 on "empty" captures; acceptance
+            // must clear the measured noise floor by a margin.
+            {
+                SampleBuffer noise = nr::synth_noise_hash(win_len, 0.5f);
+                auto n_syms = dec.demodulate(noise, 0);
+                auto n_hits = scan_all(n_syms);
+                r.sweep_null_floor = n_hits.empty()
+                                         ? 0.0f
+                                         : static_cast<float>(n_hits.front().corr);
+                r.sweep_null_gate = r.sweep_null_floor + p.sweep_null_margin;
             }
 
-            std::sort(hits.begin(), hits.end(),
-                      [](const CoresetSweepHit& a, const CoresetSweepHit& b) { return a.corr > b.corr; });
             const size_t ntop = std::min<size_t>(12, hits.size());
             r.sweep.assign(hits.begin(), hits.begin() + ntop);
 
             CoresetSweepHit best{};
             if (!hits.empty()) best = hits.front();
 
-            // Acceptance requires a STRONG hit (corr >= 0.75) or a BROAD one
-            // (corr >= min AND hits >= 5 candidates). A lone 0.6x AL1 hit is
+            // Acceptance requires a STRONG hit (corr >= 0.75 AND above the
+            // measured noise floor) or a BROAD one (corr >= min AND above the
+            // noise floor AND hits >= 5 candidates). A lone 0.6x AL1 hit is
             // the noise-floor maximum over ~100M correlations (observed floor
             // 0.65-0.69 with hits=1-2); accepting it then decoding nothing is
             // worse than reporting no detection.
-            const bool strong = best.corr >= 0.75;
-            const bool broad =
-                best.corr >= p.sweep_min_corr && best.hits >= 5;
+            const float null_gate = r.sweep_null_gate;
+            const bool strong =
+                best.corr >= 0.75f && best.corr >= null_gate;
+            const bool broad = best.corr >= p.sweep_min_corr &&
+                               best.corr >= null_gate && best.hits >= 5;
             r.sweep_accepted = false;
             if (strong || broad) {
                 dec.set_coreset(coreset_from_hit(best, p));

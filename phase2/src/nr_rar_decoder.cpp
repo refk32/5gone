@@ -75,9 +75,27 @@ void RarDecoder::set_coreset(const Coreset& coreset)
 }
 
 std::vector<Symbol> RarDecoder::demodulate(const std::vector<std::complex<float>>& iq,
-                                           uint32_t starting_slot_in_frame)
+                                           uint32_t starting_slot_in_frame,
+                                           double cfo_hz)
 {
-    return ofdm_->demodulate(iq, starting_slot_in_frame);
+    if (cfo_hz == 0.0)
+        return ofdm_->demodulate(iq, starting_slot_in_frame);
+    // Same residual-carrier-offset correction as decode(): the sweep callers
+    // demodulate once and re-scan under many CORESET configs, so the CFO must
+    // be removed here or the DM-RS correlation collapses to the noise max
+    // (observed best corr 0.6392 vs 0.90 live, before this fix).
+    std::vector<std::complex<float>> corrected = iq;
+    const double twopi_f = 2.0 * 8.0 * std::atan(1.0) * cfo_hz / sample_rate_;
+    const std::complex<double> step(std::cos(twopi_f), -std::sin(twopi_f));
+    std::complex<double> phasor(1.0, 0.0);
+    for (auto& s : corrected) {
+        const std::complex<float> c(s);
+        s = std::complex<float>(
+            static_cast<float>(c.real() * phasor.real() - c.imag() * phasor.imag()),
+            static_cast<float>(c.real() * phasor.imag() + c.imag() * phasor.real()));
+        phasor *= step;
+    }
+    return ofdm_->demodulate(corrected, starting_slot_in_frame);
 }
 
 std::vector<Dci> RarDecoder::scan_pdcch(std::vector<Symbol>& symbols)

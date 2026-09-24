@@ -66,6 +66,19 @@ public:
   void report_sib_clusters() const;
   void reset_sib_stats();
 
+  // ---- Null calibration (Path-2, P2-1) ----
+  // The scan_window() grid (120 configs) reports every candidate >= 0.5, and
+  // the live-fire / SIB-learning fences used absolute thresholds (0.9). On
+  // "empty" captures the max-of-extreme correlation over that grid climbs to
+  // 0.9+ without any PDCCH being present, so absolute fences spam/fire on
+  // noise. `ensure_null_floor()` measures the same grid's largest correlation
+  // on a synthetic noise window of the same span; `fire_floor()` is the
+  // null-calibrated fence (absolute 0.9 vs null floor + margin, whichever is
+  // higher).
+  float null_floor() const;   // grid's measured noise-only max (0 if unmeasured)
+  float fire_floor() const;   // fence scan_window hits must clear to be acted on
+  void  ensure_null_floor();
+
   // ---- Path-2 grant provider seam (P2-2) ----
   // The firing path consumes RarGrant without caring which backend produced
   // it: STATIC/TRACKED now, DECODED later (polar backend drops in behind the
@@ -145,6 +158,8 @@ public:
   std::vector<GridEntry> grid_;
   bool grid_ready_ = false;
   void ensure_grid();
+  float null_floor_ = 0.0f;
+  bool  null_ready_ = false;
   // SIB1 buckets: distinct abs slots with hits, keyed by abs % 40.
   std::set<uint64_t> sib_slots_[40];
 };

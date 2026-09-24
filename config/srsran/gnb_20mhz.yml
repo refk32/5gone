@@ -23,7 +23,7 @@ ru_sdr:
   srate: 23.04
   otw_format: sc12
   tx_gain: 80       # near-field RX-lock step: audible at 2-5 cm. Dial back when a real UE attaches.
-  rx_gain: 40
+  rx_gain: 70
 
 cell_cfg:
   dl_arfcn: 632628
@@ -35,10 +35,10 @@ cell_cfg:
   pci: 1
 
 log:
-  filename: /tmp/gnb_5gone.log
+  filename: /home/lattepanda/Projects/5gone/run/gnb_app.log
   all_level: info
   mac_level: info
-  phy_level: warning
+  phy_level: info
 
 pcap:
   mac_enable: false       # KEEP FALSE: true broke RAR scheduling (0 ra-rnti lines, 0-byte

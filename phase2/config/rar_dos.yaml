@@ -11,8 +11,11 @@ radio:
   tx_gain: 80
   rx_gain: 40
   # Second B210 serial — gNB uses the first device (see config/srsran/gnb_20mhz.yml).
-  # 2-SDR PoC roles (original pair): gNB = "000000319", attacker = "8001640".
-  # Both boards proven TX+RX over the air via /tmp/sdrcheck.py (line +48..+50 dB).
+  # CALIBRATED PAIRING (restored 2026-09-22): gNB = 000000319, attacker = 8001640.
+  # The pss_bin_shift = -187 below was validated WITH 8001640 AS THE ATTACKER
+  # (corr 0.96 @ shift -187). Running the attacker on 000000319 failed to certify
+  # the SSB on the frame grid (different B210 front-end delay / oscillator puts
+  # the PSS/SSS off-bin). Keep this pairing unless you re-calibrate the shift.
   device_args: "type=b200,serial=8001640,master_clock_rate=23.04e6,num_recv_frames=512,num_send_frames=512"
 
 cell:
@@ -20,7 +23,10 @@ cell:
   scs_khz: 30
   bandwidth_mhz: 20
   band: 78
-  pss_bin_shift: -187  # VALIDATED 2026-09-18: live B210→B210 PSS lock corr=0.96 at shift -187
+  pss_bin_shift: -187  # VALIDATED 2026-09-18 AND CONFIRMED 2026-09-22 offline rx_probe on a live TX/RX-B capture:
+                       # shift -187 -> corr 0.962 (N1: do NOT switch to -186/-185; pss_brute.py's "bin -186" is the
+                       # SSB-CENTER convention and misled a correction attempt; the runtime reference is PSS-center
+                       # based, so -187 is the true lock). -186/-185 correlate only 0.19/0.17.
                       # (SSB center = carrier -186 bins [3483.84 MHz], PSS center = -187).
                       # CAUTION: nr_pss.cpp pss_time_reference() applies the shift phase
                       # ramp ONLY when bin_shift != 0 (0 & +119 both leave PSS at +119 bins),
@@ -36,7 +42,12 @@ attack:
   # Path-2 live firing: scan_window DMRS-corr fence for a hit to become a Msg3.
   # 0.9 matches the SIB-learning confidence floor and test_slot_scan's
   # "live-fire level"; lower it only after confirming the no-DCI link's floor.
-  live_fire_corr: 0.9
+  # 2026-09-23: this rig's real PDCCH DMRS ceiling is ~0.85-0.91 on air (live
+  # sub-gate peaks 0.896-0.910), NOT the idealized ~1.0; the 0.9 floor leaves
+  # the gate 0.004 above the observed ceiling so a real RAR never fires. For a
+  # DoS overwhelm, false-fires are harmless (noise into a slot gNB ignores)
+  # but missing a real RAR is the failure mode -> gate greedily at 0.87.
+  live_fire_corr: 0.87
   # TcRntiTracker seed: gNB TC-RNTIs increment per RAR (observed 0x4601, ...).
   # 0 = unseeded (fires with tc_rnti 0 — wrong scrambling, but the loop runs).
   tc_rnti_seed: 17921   # 0x4601
